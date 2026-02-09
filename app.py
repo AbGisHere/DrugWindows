@@ -434,4 +434,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
     admet_btn.click(fn=process_admet, inputs=[], outputs={admet_status, admet_table, admet_download})
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    # JavaScript to force dark mode on load
+    force_dark_mode = """
+    function() {
+        const url = new URL(window.location);
+        if (url.searchParams.get('__theme') !== 'dark') {
+            url.searchParams.set('__theme', 'dark');
+            window.location.href = url.href;
+        }
+    }
+    """
+    demo.launch(share=True, js=force_dark_mode)

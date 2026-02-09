@@ -5,7 +5,7 @@ Includes disease mapping, UniProt search, PDB filtering, and structure download.
 
 import requests
 import os
-import shutil  # <--- ADDED for clearing folders
+import shutil   # <--- ADDED for clearing folders
 from typing import Optional, List, Dict, Tuple
 from config import DISEASE_PROTEIN_MAP
 
@@ -33,7 +33,8 @@ def clear_proteins_folder(folder_path: str = "proteins"):
 
 def map_disease_to_protein(disease_input: str) -> Optional[str]:
     """Map a disease name or condition to its protein target."""
-    disease_input = disease_input.lower().strip()
+    # UPDATED: Remove dashes as per user requirement
+    disease_input = disease_input.replace("-", "").lower().strip()
     
     for category, conditions in DISEASE_PROTEIN_MAP.items():
         if disease_input in conditions:
@@ -43,6 +44,7 @@ def map_disease_to_protein(disease_input: str) -> Optional[str]:
     
     for category, conditions in DISEASE_PROTEIN_MAP.items():
         for condition_key, protein_name in conditions.items():
+            # Check for partial matches using the sanitized input
             if disease_input in condition_key or condition_key in disease_input:
                 return protein_name
     
@@ -52,15 +54,39 @@ def map_disease_to_protein(disease_input: str) -> Optional[str]:
 def search_uniprot_for_reviewed_human(protein_name: str, limit: int = 5) -> List[str]:
     """
     Search UniProt for reviewed (Swiss-Prot) human protein entries.
-    Returns a list of UniProt accession IDs (up to `limit`).
+    Uses a broad search strategy to catch Gene Names, Synonyms, and Protein Names.
     """
     url = "https://rest.uniprot.org/uniprotkb/search"
+    
+    # SIMPLIFIED QUERY STRATEGY:
+    # 1. Search the term broadly (matches Gene Name, Protein Name, Synonyms, etc.)
+    # 2. Strict filter for Human (9606) and Reviewed (Swiss-Prot)
+    # 3. 'sort:score' is removed (it's the default and can cause API errors if explicit)
+    
+    query_string = f"{protein_name} AND (organism_id:9606) AND (reviewed:true)"
+
     params = {
-        "query": f"(protein_name:{protein_name}) AND (organism_id:9606)",
+        "query": query_string,
         "format": "json",
         "size": limit
     }
     
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        results = data.get('results', [])
+        if not results:
+            return []
+        
+        # Return the Primary Accession ID (e.g., 'P35354' for COX2/PTGS2)
+        return [r['primaryAccession'] for r in results]
+        
+    except requests.exceptions.RequestException as e:
+        print(f"UniProt search error: {e}")
+        return []
+        
     try:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
@@ -217,13 +243,16 @@ def find_best_pdb_structure(protein_name: str, max_check: int = 100) -> Optional
     Find the best PDB structure for a protein OR download a specific PDB ID.
     
     UPDATED: Clears the 'proteins' folder at the start of every run.
+    UPDATED: Removes dashes from input before searching.
     """
     
     # --- STEP 1: CLEAR OLD DATA ---
     # This ensures only the new protein exists in the folder
     clear_proteins_folder() 
     
-    clean_input = protein_name.strip()
+    # --- UPDATED SANITIZATION ---
+    # Remove dashes and strip whitespace from input
+    clean_input = protein_name.replace("-", "").strip()
     
     # --- Check for Direct PDB ID Input ---
     if is_pdb_id(clean_input):
@@ -237,11 +266,12 @@ def find_best_pdb_structure(protein_name: str, max_check: int = 100) -> Optional
             print(f"Could not download PDB ID {pdb_id}. Falling back to name search...")
 
     # --- Standard Search Logic via UniProt ---
-    print(f"Searching UniProt for: {protein_name}")
-    uniprot_ids = search_uniprot_for_reviewed_human(protein_name, limit=5)
+    # Uses the sanitized 'clean_input' instead of 'protein_name'
+    print(f"Searching UniProt for: {clean_input}")
+    uniprot_ids = search_uniprot_for_reviewed_human(clean_input, limit=5)
     
     if not uniprot_ids:
-        print(f"No reviewed human protein found for: {protein_name}")
+        print(f"No reviewed human protein found for: {clean_input}")
         return None
     
     print(f"Found {len(uniprot_ids)} UniProt candidates: {', '.join(uniprot_ids)}")

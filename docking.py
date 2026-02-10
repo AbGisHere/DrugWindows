@@ -1,6 +1,8 @@
 """
 Molecular docking module using AutoDock Vina Executable
-Supports splitting receptor into chains.
+Uses coordinates (center_x, center_y, center_z) from Combined CSV directly.
+Outputs coordinates in the final table.
+Removes image paths and receptor paths from the displayed table.
 """
 
 import os
@@ -51,7 +53,7 @@ def split_pdbqt_chains(pdbqt_path, output_base_dir):
     return chains
 
 def run_molecular_docking():
-    """Run molecular docking on EACH CHAIN individually using Combined CSV."""
+    """Run molecular docking on EACH CHAIN individually using Combined CSV Coordinates."""
     
     if not current_pdb_info.get("prepared_pdbqt"):
         return (
@@ -69,6 +71,7 @@ def run_molecular_docking():
     )
     
     try:
+        # Clean previous results
         if os.path.exists(DOCKING_RESULTS_DIR):
             try: shutil.rmtree(DOCKING_RESULTS_DIR)
             except Exception: pass
@@ -86,7 +89,7 @@ def run_molecular_docking():
         # --- LOCATE COMBINED CSV ---
         # 1. Check Config
         csv_file = current_pdb_info.get("combined_csv")
-        # 2. Check File System directly if config is missing
+        # 2. Check File System directly if config is missing (fallback)
         if not csv_file or not os.path.exists(csv_file):
             potential = os.path.join(PRANKWEB_OUTPUT_DIR, "combined_pockets.csv")
             if os.path.exists(potential):
@@ -100,12 +103,20 @@ def run_molecular_docking():
             yield (gr.update(value="<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ Ligand folder not found.</div>", visible=True), None, gr.update(choices=[]), gr.update(choices=[]))
             return
         
-        # Load CSV
-        df = pd.read_csv(csv_file)
-        df.columns = df.columns.str.strip()
-        required_cols = ['name', 'center_x', 'center_y', 'center_z']
-        if any(col not in df.columns for col in required_cols):
-            yield (gr.update(value=f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ CSV format error. Missing columns.</div>", visible=True), None, gr.update(choices=[]), gr.update(choices=[]))
+        # --- LOAD CSV AND VALIDATE COORDINATES ---
+        try:
+            df = pd.read_csv(csv_file)
+            df.columns = df.columns.str.strip()
+            
+            # CRITICAL: We strictly require XYZ columns now.
+            required_cols = ['name', 'center_x', 'center_y', 'center_z']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            
+            if missing_cols:
+                yield (gr.update(value=f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ CSV format error. Missing columns: {', '.join(missing_cols)}</div>", visible=True), None, gr.update(choices=[]), gr.update(choices=[]))
+                return
+        except Exception as e:
+            yield (gr.update(value=f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ Error reading CSV: {str(e)}</div>", visible=True), None, gr.update(choices=[]), gr.update(choices=[]))
             return
 
         ligand_files = glob.glob(os.path.join(ligand_folder, "*.pdbqt"))
@@ -123,6 +134,7 @@ def run_molecular_docking():
             os.makedirs(output_dir_pdbqt, exist_ok=True)
             os.makedirs(output_dir_pdb, exist_ok=True)
 
+            # Convert receptor to PDB for complex generation later
             chain_receptor_pdb = os.path.join(output_dir_pdb, "receptor_ref.pdb")
             subprocess.run(['obabel', chain_receptor_pdbqt, '-O', chain_receptor_pdb], check=False, capture_output=True)
 
@@ -131,12 +143,21 @@ def run_molecular_docking():
                 ligand_best_poses = []
                 
                 for index, row in df.iterrows():
-                    # Names are now unique e.g., 'p2rank_pocket1' or 'fpocket_pocket7'
                     pocket_name = str(row['name']).strip()
-                    cx, cy, cz = float(row['center_x']), float(row['center_y']), float(row['center_z'])
                     
+                    # --- CRITICAL: EXTRACT COORDINATES ---
+                    try:
+                        cx = float(row['center_x'])
+                        cy = float(row['center_y'])
+                        cz = float(row['center_z'])
+                    except ValueError:
+                        print(f"Skipping pocket {pocket_name}: Invalid coordinates.")
+                        continue
+                    # -------------------------------------
+
                     output_pdbqt_file = os.path.join(output_dir_pdbqt, f"{ligand_name}_{pocket_name}_poses.pdbqt")
 
+                    # Vina command using explicit center_x/y/z
                     cmd = [
                         VINA_EXE, "--receptor", chain_receptor_pdbqt, "--ligand", ligand_pdbqt,
                         "--center_x", str(cx), "--center_y", str(cy), "--center_z", str(cz),
@@ -147,6 +168,7 @@ def run_molecular_docking():
                     try:
                         result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
                         
+                        # Parse Vina Output
                         for line in result.stdout.splitlines():
                             if re.match(r'^\s*\d+', line):
                                 parts = line.split()
@@ -154,24 +176,29 @@ def run_molecular_docking():
                                     try:
                                         mode_num, affinity = int(parts[0]), float(parts[1])
                                         if affinity <= 0.0:
+                                            # --- DATA ENTRY ---
                                             ligand_best_poses.append({
                                                 'chain': chain_id,
                                                 'ligand': ligand_name,
                                                 'pocket': pocket_name,
+                                                # Coordinates added
+                                                'center_x': cx,
+                                                'center_y': cy,
+                                                'center_z': cz,
                                                 'pose_number': mode_num,
                                                 'binding_energy': affinity,
-                                                'pdb_file': os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_ligand.pdb"),
-                                                'receptor_pdb_file': chain_receptor_pdb,
-                                                'interaction_image': "N/A" 
+                                                'pdb_file': os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_ligand.pdb")
+                                                # Removed: 'receptor_pdb_file'
+                                                # Removed: 'interaction_image' 
                                             })
                                     except ValueError: continue
 
-                        # Post-processing
+                        # Post-processing (PDB conversion and Complex generation)
                         if os.path.exists(output_pdbqt_file):
                             pdb_ligand_only = os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_ligand.pdb")
                             subprocess.run(['obabel', output_pdbqt_file, '-O', pdb_ligand_only, '-h'], check=False, capture_output=True)
 
-                            # Complex Generation
+                            # Complex Generation (Optional but kept for structure viewing if needed externally)
                             complex_file = os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_complex.pdb")
                             rec_lines, lig_lines = [], []
                             
@@ -191,18 +218,7 @@ def run_molecular_docking():
                                 if rec_lines and not rec_lines[-1].strip() == "TER": cf.write("TER\n")
                                 cf.writelines(lig_lines)
                                 cf.write("END\n")
-
-                            # Pandamap
-                            if os.path.exists(complex_file):
-                                interactions_png = os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_inter.png")
-                                try:
-                                    subprocess.run(f"pandamap {complex_file} --output {interactions_png}", shell=True, check=True, capture_output=True)
-                                    if os.path.exists(interactions_png):
-                                        for entry in ligand_best_poses:
-                                            if entry['ligand'] == ligand_name and entry['pocket'] == pocket_name:
-                                                entry['interaction_image'] = interactions_png
-                                except: pass
-
+                            
                     except subprocess.CalledProcessError: continue
                 
                 if ligand_best_poses:
@@ -212,6 +228,14 @@ def run_molecular_docking():
         # --- Output Logic ---
         if summary_data:
             summary_df = pd.DataFrame(summary_data)
+            
+            # Keep only the requested columns
+            cols = ['chain', 'ligand', 'pocket', 'center_x', 'center_y', 'center_z', 'pose_number', 'binding_energy', 'pdb_file']
+            
+            # Filter columns
+            final_cols = [c for c in cols if c in summary_df.columns]
+            summary_df = summary_df[final_cols]
+            
             unique_chains = sorted(summary_df['chain'].unique())
             default_chain = unique_chains[0]
             
@@ -239,4 +263,6 @@ def run_molecular_docking():
             )
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         yield (gr.update(value=f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ Error: {str(e)}</div>", visible=True), None, gr.update(choices=[]), gr.update(choices=[]))

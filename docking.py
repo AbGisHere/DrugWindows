@@ -127,10 +127,15 @@ def run_molecular_docking():
         summary_data = []
 
         # --- DOCKING LOOP ---
+        # Create a dedicated directory for PandaMap reports (Centralized)
+        output_dir_reports = os.path.join(DOCKING_RESULTS_DIR, "docking_reports")
+        os.makedirs(output_dir_reports, exist_ok=True)
+
         for chain_id, chain_receptor_pdbqt in chain_map.items():
             chain_base_dir = os.path.dirname(chain_receptor_pdbqt)
             output_dir_pdbqt = os.path.join(chain_base_dir, "docked_pdbqt")
             output_dir_pdb = os.path.join(chain_base_dir, "docked_pdb")
+            
             os.makedirs(output_dir_pdbqt, exist_ok=True)
             os.makedirs(output_dir_pdb, exist_ok=True)
 
@@ -218,7 +223,32 @@ def run_molecular_docking():
                                 if rec_lines and not rec_lines[-1].strip() == "TER": cf.write("TER\n")
                                 cf.writelines(lig_lines)
                                 cf.write("END\n")
-                            
+
+                            # --- PANDAMAP INTEGRATION ---
+                            # Only run if complex file was successfully created
+                            if os.path.exists(complex_file):
+                                # Include chain_id in report filenames to avoid collisions
+                                pandamap_image = os.path.join(output_dir_reports, f"{chain_id}_{ligand_name}_{pocket_name}_interaction.png")
+                                pandamap_report = os.path.join(output_dir_reports, f"{chain_id}_{ligand_name}_{pocket_name}_report.txt")
+                                
+                                pandamap_cmd = [
+                                    "pandamap",
+                                    complex_file,
+                                    "--output", pandamap_image,
+                                    "--title", f"{ligand_name} in {pocket_name} (Chain {chain_id})",
+                                    "--report",
+                                    "--report-file", pandamap_report,
+                                    "--no-3d-cues",
+                                    "--dpi", "300"
+                                ]
+                                
+                                try:
+                                    # Run PandaMap silently
+                                    subprocess.run(pandamap_cmd, check=False, capture_output=True)
+                                except Exception as pm_e:
+                                    print(f"PandaMap generation failed for {complex_file}: {pm_e}")
+                            # ----------------------------
+                    
                     except subprocess.CalledProcessError: continue
                 
                 if ligand_best_poses:
@@ -246,7 +276,7 @@ def run_molecular_docking():
                 value = f"{row['pdb_file']}::{row['pose_number']}::{row['chain']}"
                 pose_choices.append((label, value))
 
-            success_msg = f"<div style='padding: 20px; background: #d4edda; border-radius: 8px; color: #155724;'>✅ Docking completed! Found {len(summary_data)} total poses.</div>"
+            success_msg = f"<div style='padding: 20px; background: #d4edda; border-radius: 8px; color: #155724;'>✅ Docking completed! Found {len(summary_data)} total poses. Reports generated in docked_reports.</div>"
             
             yield (
                 gr.update(value=success_msg, visible=True),

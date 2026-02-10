@@ -1,7 +1,7 @@
 # app.py
 """
 Main Gradio interface for Protein Structure Finder & Analyzer
-Updated version: Includes Fpocket Integration in Tab 3.
+Updated version: displays external text reports in Docking Tab.
 """
 
 import os
@@ -109,7 +109,6 @@ def process_ligand_analysis():
             }
         
         # Extract ligand filenames from the 'Converted_PDB' column
-        # This ensures the dropdown shows .pdb files
         if 'Converted_PDB' in df.columns:
             ligand_files = df['Converted_PDB'].dropna().tolist()
         else:
@@ -134,8 +133,6 @@ def visualize_ligand_only(ligand_file):
     if not ligand_file:
         return ""
     
-    # ligand_file is now a .pdb name from the dropdown (e.g. "ligand_1.pdb")
-    # We access the 'ligand_pdb' directory directly
     ligand_path = os.path.join("ligand_pdb", ligand_file)
     
     if not os.path.exists(ligand_path):
@@ -145,7 +142,6 @@ def visualize_ligand_only(ligand_file):
         with open(ligand_path, 'r') as f:
             ligand_content = f.read()
             
-        # Pass None as protein_text to visualize only the ligand
         html = show_structure(
             protein_text=None,
             ligand_text=ligand_content,
@@ -179,7 +175,8 @@ def visualize_docking_result(selection_value: str, summary_df: pd.DataFrame):
     if not selection_value:
         return "⚠️ Please select a pose to view.", None
         
-    image_path = None
+    report_text = None
+    
     try:
         parts = selection_value.split("::")
         if len(parts) < 3:
@@ -194,27 +191,80 @@ def visualize_docking_result(selection_value: str, summary_df: pd.DataFrame):
         target_pose_num = int(pose_num_str)
         receptor_pdb_path = None
         
+        # 1. Retrieve Metadata & Load External Report
         if summary_df is not None and not summary_df.empty:
             try:
                 row = summary_df[
                     (summary_df['pdb_file'].astype(str) == str(ligand_path)) & 
                     (summary_df['pose_number'].astype(int) == target_pose_num)
                 ]
+                
                 if not row.empty:
-                    img_p = row.iloc[0]['interaction_image']
-                    if img_p and isinstance(img_p, str) and os.path.exists(img_p) and img_p != "N/A":
-                        image_path = img_p
+                    info = row.iloc[0]
+                    
+                    # Get Receptor Path
                     if 'receptor_pdb_file' in row.columns:
-                        rec_p = row.iloc[0]['receptor_pdb_file']
+                        rec_p = info['receptor_pdb_file']
                         if rec_p and os.path.exists(rec_p):
                             receptor_pdb_path = rec_p
-            except: pass
+                    
+                    # --- NEW LOGIC: Load Centralized External Text Report ---
+                    ligand_name = info.get('ligand', 'Unknown')
+                    pocket_name = info.get('pocket', 'Unknown')
+                    chain_id = info.get('chain', 'Unknown')
+                    
+                    # Centralized report directory
+                    # Structure is: docking_results/docking_reports/{chain_id}_{ligand_name}_{pocket_name}_report.txt
+                    
+                    # DOCKING_RESULTS_DIR is used in docking.py, but we can infer it or use it if available
+                    # Actually, we can get it from config if we want, or just use the relative path
+                    # Let's check where we are. Usually current_pdb_info is in config.
+                    from config import DOCKING_RESULTS_DIR
+                    report_dir = os.path.join(DOCKING_RESULTS_DIR, "docking_reports")
+                    
+                    report_filename = f"{chain_id}_{ligand_name}_{pocket_name}_report.txt"
+                    full_report_path = os.path.join(report_dir, report_filename)
+                    
+                    external_report_content = "⚠️ Report file not found."
+                    if os.path.exists(full_report_path):
+                        try:
+                            with open(full_report_path, "r", encoding="utf-8") as rf:
+                                external_report_content = rf.read()
+                        except Exception as e:
+                            external_report_content = f"⚠️ Error reading report: {str(e)}"
+                    else:
+                        external_report_content = f"⚠️ Report file missing at: {report_filename}"
+
+                    # Generate Markdown Report
+                    report_text = f"""
+                    ### 📄 Pose Details
+                    
+                    | Property | Value |
+                    | :--- | :--- |
+                    | **Ligand** | {ligand_name} |
+                    | **Binding Pocket** | {pocket_name} |
+                    | **Chain** | {info.get('chain', 'N/A')} |
+                    | **Pose Number** | {info.get('pose_number', 'N/A')} |
+                    | **Binding Affinity** | **{info.get('binding_energy', 'N/A')} kcal/mol** |
+                    
+                    ---
+                    ### 🧬 Interaction Profile Report
+                    ```text
+                    {external_report_content}
+                    ```
+                    """
+            except Exception as e:
+                print(f"Error extracting metadata: {e}")
         
+        if not report_text:
+            report_text = "### ⚠️ No detailed report data available for this pose."
+
+        # 2. Load Structure for Visualization
         if not receptor_pdb_path:
              receptor_pdb_path = current_pdb_info.get("pdb_path")
 
         if not os.path.exists(ligand_path):
-            return f"❌ Ligand file not found.", image_path
+            return f"❌ Ligand file not found.", report_text
             
         with open(receptor_pdb_path, 'r') as f:
             protein_text = f.read()
@@ -251,7 +301,7 @@ def visualize_docking_result(selection_value: str, summary_df: pd.DataFrame):
             pdb_id="Docking", 
             protein_name=display_name
         )
-        return html_viewer, image_path
+        return html_viewer, report_text
 
     except Exception as e:
         return f"❌ Visualization Error: {str(e)}", None
@@ -373,11 +423,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
                 chain_selector = gr.Dropdown(label="1. Select Chain Results", choices=[], interactive=True, visible=False)
                 pose_selector = gr.Dropdown(label="2. Select Pose to View", choices=[], interactive=True, visible=False)
             view_pose_btn = gr.Button("View Pose & Interactions", variant="primary")
+            
             with gr.Row():
                 with gr.Column(scale=2):
                     docked_viewer = gr.HTML(label="3D Interaction Viewer")
                 with gr.Column(scale=1):
-                    interaction_image_viewer = gr.Image(label="2D Interaction Map", type="filepath", visible=True)
+                    # Shows the Report Text
+                    docking_report_area = gr.Markdown(label="Pose Details", visible=True)
+                    
             with gr.Row():
                 prev_btn_4 = gr.Button("← Previous", variant="secondary")
                 next_btn_4 = gr.Button("Next: ADMET →", variant="primary")
@@ -429,7 +482,13 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
     
     docking_btn.click(fn=run_molecular_docking, inputs=[], outputs=[docking_status, docking_summary, chain_selector, pose_selector])
     chain_selector.change(fn=filter_poses_by_chain, inputs=[chain_selector, docking_summary], outputs=[pose_selector])
-    view_pose_btn.click(fn=visualize_docking_result, inputs=[pose_selector, docking_summary], outputs=[docked_viewer, interaction_image_viewer])
+    
+    # UPDATED: View Pose with Report Output
+    view_pose_btn.click(
+        fn=visualize_docking_result, 
+        inputs=[pose_selector, docking_summary], 
+        outputs=[docked_viewer, docking_report_area]
+    )
     
     admet_btn.click(fn=process_admet, inputs=[], outputs={admet_status, admet_table, admet_download})
 

@@ -1,7 +1,7 @@
 # app.py
 """
 Main Gradio interface for Protein Structure Finder & Analyzer
-Updated version: displays external text reports in Docking Tab.
+Updated version: Wires Protein Prep to update all tabs on retry.
 """
 
 import os
@@ -20,35 +20,44 @@ from utils import map_disease_to_protein, find_best_pdb_structure
 from visualization import show_structure
 
 def process_disease(user_input: str):
-    """Main function to process disease/protein input."""
+    """
+    Main function to process disease/protein input.
+    Returns updates for Search Tab AND clears Ramachandran Tab.
+    """
     
+    # Define "Clear" updates for Ramachandran components
+    clear_ram_status = gr.update(value="", visible=False)
+    clear_ram_stats = gr.update(value="", visible=False)
+    clear_plot = gr.update(value=None, visible=False)
+
     if not user_input.strip():
         current_pdb_info.update({"pdb_id": None, "pdb_path": None})
-        return {
-            info_box: gr.update(visible=False),
-            structure_viewer: gr.update(value=""),
-            download_file: gr.update(value=None),
-            search_status: gr.update(value="⚠️ Please enter a disease or protein name", visible=True)
-        }
+        return (
+            gr.update(visible=False),           # info_box
+            gr.update(value=""),                # structure_viewer
+            gr.update(value=None),              # download_file
+            gr.update(value="⚠️ Please enter a disease or protein name", visible=True), # search_status
+            clear_ram_status, clear_ram_stats, clear_plot, clear_plot, clear_plot, clear_plot
+        )
     
     protein_name = map_disease_to_protein(user_input)
-    is_direct_protein = False
     
     if not protein_name:
         protein_name = user_input.strip()
-        is_direct_protein = True
     
+    # Search for structure
     result = find_best_pdb_structure(protein_name, max_check=100)
     
     if not result:
         current_pdb_info.update({"pdb_id": None, "pdb_path": None})
         error_msg = f"❌ No suitable PDB structure found for: {protein_name}"
-        return {
-            info_box: gr.update(visible=False),
-            structure_viewer: gr.update(value=""),
-            download_file: gr.update(value=None),
-            search_status: gr.update(value=error_msg, visible=True)
-        }
+        return (
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(value=None),
+            gr.update(value=error_msg, visible=True),
+            clear_ram_status, clear_ram_stats, clear_plot, clear_plot, clear_plot, clear_plot
+        )
     
     pdb_id, pdb_path = result
     
@@ -56,6 +65,7 @@ def process_disease(user_input: str):
         with open(pdb_path, 'r') as f:
             pdb_content = f.read()
         
+        # Update Global Config
         current_pdb_info.update({
             "pdb_id": pdb_id, 
             "pdb_path": pdb_path, 
@@ -66,11 +76,10 @@ def process_disease(user_input: str):
         
         info_html = f"""
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 24px; border-radius: 16px; color: white;">
-            <h3>Structure Loaded</h3>
+            <h3 style='margin-top:0;'>🧬 Structure Loaded</h3>
             <p><strong>Input:</strong> {user_input}</p>
-            <p><strong>Protein:</strong> {protein_name}</p>
+            <p><strong>Target:</strong> {protein_name}</p>
             <p><strong>PDB ID:</strong> {pdb_id}</p>
-            <p><strong>Species:</strong> Homo-sapiens</p>
         </div>
         """
         
@@ -81,20 +90,22 @@ def process_disease(user_input: str):
             protein_name=protein_name
         )
         
-        return {
-            info_box: gr.update(value=info_html, visible=True),
-            structure_viewer: gr.update(value=structure_html),
-            download_file: gr.update(value=pdb_path),
-            search_status: gr.update(value="✅ Structure loaded successfully!", visible=True)
-        }
+        return (
+            gr.update(value=info_html, visible=True),         # info_box
+            gr.update(value=structure_html),                  # structure_viewer
+            gr.update(value=pdb_path),                        # download_file
+            gr.update(value="✅ Structure loaded successfully!", visible=True), # search_status
+            clear_ram_status, clear_ram_stats, clear_plot, clear_plot, clear_plot, clear_plot
+        )
         
     except Exception as e:
-        return {
-            info_box: gr.update(visible=False),
-            structure_viewer: gr.update(value=""),
-            download_file: gr.update(value=None),
-            search_status: gr.update(value=f"❌ Error: {str(e)}", visible=True)
-        }
+        return (
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(value=None),
+            gr.update(value=f"❌ Error: {str(e)}", visible=True),
+            clear_ram_status, clear_ram_stats, clear_plot, clear_plot, clear_plot, clear_plot
+        )
 
 def process_ligand_analysis():
     """Logic for the new Ligand Analysis tab with dropdown update."""
@@ -208,20 +219,14 @@ def visualize_docking_result(selection_value: str, summary_df: pd.DataFrame):
                         if rec_p and os.path.exists(rec_p):
                             receptor_pdb_path = rec_p
                     
-                    # --- NEW LOGIC: Load Centralized External Text Report ---
+                    # --- Load External Text Report ---
                     ligand_name = info.get('ligand', 'Unknown')
                     pocket_name = info.get('pocket', 'Unknown')
                     chain_id = info.get('chain', 'Unknown')
                     
-                    # Centralized report directory
-                    # Structure is: docking_results/docking_reports/{chain_id}_{ligand_name}_{pocket_name}_report.txt
-                    
-                    # DOCKING_RESULTS_DIR is used in docking.py, but we can infer it or use it if available
-                    # Actually, we can get it from config if we want, or just use the relative path
-                    # Let's check where we are. Usually current_pdb_info is in config.
+                    # Report path construction
                     from config import DOCKING_RESULTS_DIR
                     report_dir = os.path.join(DOCKING_RESULTS_DIR, "docking_reports")
-                    
                     report_filename = f"{chain_id}_{ligand_name}_{pocket_name}_report.txt"
                     full_report_path = os.path.join(report_dir, report_filename)
                     
@@ -473,17 +478,42 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
     next_btn_5.click(lambda: gr.Tabs(selected=0), None, tabs)
 
     # Core Logic Connections
-    search_btn.click(process_disease, inputs=[disease_input], outputs={info_box, structure_viewer, download_file, search_status})
-    ramplot_btn.click(fn=run_ramplot, inputs=[], outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats])
-    prepare_btn.click(fn=prepare_protein_meeko, inputs=[], outputs=[prepare_status, prepared_viewer, prepared_download])
     
-    # UPDATED: P2Rank + Fpocket Trigger
+    # Search Button outputs to Search Tab + Ramachandran Tab
+    search_btn.click(
+        fn=process_disease, 
+        inputs=[disease_input], 
+        outputs=[
+            info_box, structure_viewer, download_file, search_status,  # Search Tab
+            ramplot_status, ramplot_stats, plot1, plot2, plot3, plot4  # Ramachandran Tab (Cleared)
+        ]
+    )
+    
+    ramplot_btn.click(fn=run_ramplot, inputs=[], outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats])
+    
+    # CRITICAL: Prepare Button now updates Prep (3), Search (4), Ramplot (6) = 13 total
+    prepare_btn.click(
+        fn=prepare_protein_meeko, 
+        inputs=[], 
+        outputs=[
+            # Tab 2: Protein Prep (3 outputs)
+            prepare_status, prepared_viewer, prepared_download,
+            
+            # Tab 0: Search (4 outputs)
+            info_box, structure_viewer, download_file, search_status,
+            
+            # Tab 1: Ramachandran (6 outputs)
+            ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats
+        ]
+    )
+    
+    # P2Rank + Fpocket Trigger
     prankweb_btn.click(fn=run_prankweb_prediction, inputs=[], outputs=[prankweb_status, prankweb_results, fpocket_results])
     
     docking_btn.click(fn=run_molecular_docking, inputs=[], outputs=[docking_status, docking_summary, chain_selector, pose_selector])
     chain_selector.change(fn=filter_poses_by_chain, inputs=[chain_selector, docking_summary], outputs=[pose_selector])
     
-    # UPDATED: View Pose with Report Output
+    # View Pose with Report Output
     view_pose_btn.click(
         fn=visualize_docking_result, 
         inputs=[pose_selector, docking_summary], 

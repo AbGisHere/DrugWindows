@@ -5,9 +5,9 @@ Includes disease mapping, UniProt search, PDB filtering, and structure download.
 
 import requests
 import os
-import shutil   # <--- ADDED for clearing folders
+import shutil
 from typing import Optional, List, Dict, Tuple
-from config import DISEASE_PROTEIN_MAP
+from config import DISEASE_PROTEIN_MAP, current_pdb_info # Ensure current_pdb_info is imported to store the name
 
 # --- NEW HELPER FUNCTION ---
 def clear_proteins_folder(folder_path: str = "proteins"):
@@ -30,10 +30,8 @@ def clear_proteins_folder(folder_path: str = "proteins"):
     
     print(f"✓ Cleared '{folder_path}' directory.")
 
-
 def map_disease_to_protein(disease_input: str) -> Optional[str]:
     """Map a disease name or condition to its protein target."""
-    # UPDATED: Remove dashes as per user requirement
     disease_input = disease_input.replace("-", "").lower().strip()
     
     for category, conditions in DISEASE_PROTEIN_MAP.items():
@@ -44,25 +42,14 @@ def map_disease_to_protein(disease_input: str) -> Optional[str]:
     
     for category, conditions in DISEASE_PROTEIN_MAP.items():
         for condition_key, protein_name in conditions.items():
-            # Check for partial matches using the sanitized input
             if disease_input in condition_key or condition_key in disease_input:
                 return protein_name
     
     return None
 
-
 def search_uniprot_for_reviewed_human(protein_name: str, limit: int = 5) -> List[str]:
-    """
-    Search UniProt for reviewed (Swiss-Prot) human protein entries.
-    Uses a broad search strategy to catch Gene Names, Synonyms, and Protein Names.
-    """
+    """Search UniProt for reviewed (Swiss-Prot) human protein entries."""
     url = "https://rest.uniprot.org/uniprotkb/search"
-    
-    # SIMPLIFIED QUERY STRATEGY:
-    # 1. Search the term broadly (matches Gene Name, Protein Name, Synonyms, etc.)
-    # 2. Strict filter for Human (9606) and Reviewed (Swiss-Prot)
-    # 3. 'sort:score' is removed (it's the default and can cause API errors if explicit)
-    
     query_string = f"{protein_name} AND (organism_id:9606) AND (reviewed:true)"
 
     params = {
@@ -80,28 +67,11 @@ def search_uniprot_for_reviewed_human(protein_name: str, limit: int = 5) -> List
         if not results:
             return []
         
-        # Return the Primary Accession ID (e.g., 'P35354' for COX2/PTGS2)
         return [r['primaryAccession'] for r in results]
         
     except requests.exceptions.RequestException as e:
         print(f"UniProt search error: {e}")
         return []
-        
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        results = data.get('results', [])
-        if not results:
-            return []
-        
-        return [r['primaryAccession'] for r in results]
-        
-    except requests.exceptions.RequestException as e:
-        print(f"UniProt search error: {e}")
-        return []
-
 
 def get_pdb_ids_from_uniprot(uniprot_id: str) -> List[str]:
     """Get all PDB IDs associated with a UniProt entry."""
@@ -127,12 +97,8 @@ def get_pdb_ids_from_uniprot(uniprot_id: str) -> List[str]:
         print(f"Error fetching PDB IDs from UniProt: {e}")
         return []
 
-
 def get_pdb_resolution(pdb_id: str) -> Optional[float]:
-    """
-    Get the resolution of a PDB structure.
-    Returns None if resolution is not available or not X-ray.
-    """
+    """Get the resolution of a PDB structure."""
     url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
     
     try:
@@ -161,7 +127,6 @@ def get_pdb_resolution(pdb_id: str) -> Optional[float]:
     except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
         print(f"Error fetching resolution for {pdb_id}: {e}")
         return None
-
 
 def check_mutations_in_pdb(pdb_id: str) -> bool:
     """Check if a PDB structure contains mutations in ANY chain."""
@@ -195,7 +160,6 @@ def check_mutations_in_pdb(pdb_id: str) -> bool:
     
     return False
 
-
 def download_pdb_file(pdb_id: str, output_dir: str = "proteins") -> Optional[str]:
     """Download a PDB file and save it to the specified directory."""
     os.makedirs(output_dir, exist_ok=True)
@@ -212,7 +176,6 @@ def download_pdb_file(pdb_id: str, output_dir: str = "proteins") -> Optional[str
     except requests.exceptions.RequestException as e:
         print(f"Error downloading PDB file {pdb_id}: {e}")
         return None
-
 
 def download_fasta_file(pdb_id: str, output_dir: str = "proteins") -> Optional[str]:
     """Download a FASTA file for a PDB structure."""
@@ -231,42 +194,42 @@ def download_fasta_file(pdb_id: str, output_dir: str = "proteins") -> Optional[s
         print(f"Error downloading FASTA file {pdb_id}: {e}")
         return None
 
-
 def is_pdb_id(text: str) -> bool:
     """Check if the input string looks like a PDB ID."""
     text = text.strip()
     return len(text) == 4 and text[0].isdigit() and text.isalnum()
 
-
-def find_best_pdb_structure(protein_name: str, max_check: int = 100) -> Optional[Tuple[str, str]]:
+# --- UPDATED FUNCTION ---
+def find_best_pdb_structure(protein_name: str, max_check: int = 100, excluded_pdbs: List[str] = None) -> Optional[Tuple[str, str]]:
     """
-    Find the best PDB structure for a protein OR download a specific PDB ID.
-    
-    UPDATED: Clears the 'proteins' folder at the start of every run.
-    UPDATED: Removes dashes from input before searching.
+    Find the best PDB structure for a protein, ignoring IDs in excluded_pdbs.
     """
+    if excluded_pdbs is None:
+        excluded_pdbs = []
+        
+    # Store the search term in global config so we can retry later if needed
+    current_pdb_info["search_term"] = protein_name 
     
     # --- STEP 1: CLEAR OLD DATA ---
-    # This ensures only the new protein exists in the folder
     clear_proteins_folder() 
     
-    # --- UPDATED SANITIZATION ---
-    # Remove dashes and strip whitespace from input
     clean_input = protein_name.replace("-", "").strip()
     
-    # --- Check for Direct PDB ID Input ---
+    # Direct PDB ID Input
     if is_pdb_id(clean_input):
         pdb_id = clean_input.upper()
+        # If user explicitly asks for a PDB that failed, we must try it anyway 
+        # (or handle specific logic here, but usually manual input overrides exclusion)
         print(f"Input detected as PDB ID: {pdb_id}")
         pdb_path = download_pdb_file(pdb_id)
         if pdb_path:
             download_fasta_file(pdb_id)
             return (pdb_id, pdb_path)
         else:
-            print(f"Could not download PDB ID {pdb_id}. Falling back to name search...")
+            print(f"Could not download PDB ID {pdb_id}.")
+            return None
 
-    # --- Standard Search Logic via UniProt ---
-    # Uses the sanitized 'clean_input' instead of 'protein_name'
+    # UniProt Search
     print(f"Searching UniProt for: {clean_input}")
     uniprot_ids = search_uniprot_for_reviewed_human(clean_input, limit=5)
     
@@ -276,27 +239,25 @@ def find_best_pdb_structure(protein_name: str, max_check: int = 100) -> Optional
     
     print(f"Found {len(uniprot_ids)} UniProt candidates: {', '.join(uniprot_ids)}")
     
-    # Store the best candidate found across ALL UniProt IDs
-    # Structure: (pdb_id, resolution, from_uniprot_id)
     overall_best_candidate = None 
     
-    # Iterate through ALL UniProt IDs
     for uid_idx, uniprot_id in enumerate(uniprot_ids):
         print(f"\n--- Checking UniProt ID [{uid_idx+1}/{len(uniprot_ids)}]: {uniprot_id} ---")
         
         pdb_ids = get_pdb_ids_from_uniprot(uniprot_id)
         if not pdb_ids:
-            print(f"No PDB structures found for UniProt ID: {uniprot_id}")
             continue 
         
-        print(f"Found {len(pdb_ids)} PDB structures. Checking best candidates...")
-        
-        current_uniprot_best = None # Best for THIS specific UniProt ID
+        current_uniprot_best = None
         checked_count = 0
         
         for i, pdb_id in enumerate(pdb_ids):
+            # --- SKIP EXCLUDED PDBS ---
+            if pdb_id in excluded_pdbs:
+                print(f"Skipping {pdb_id} (previously failed).")
+                continue
+
             if checked_count >= max_check:
-                print(f"Reached maximum check limit ({max_check}) for this UniProt ID.")
                 break
             
             resolution = get_pdb_resolution(pdb_id)
@@ -311,55 +272,31 @@ def find_best_pdb_structure(protein_name: str, max_check: int = 100) -> Optional
             
             print(" - valid ✓")
             
-            # Update best for THIS UniProt ID
             if current_uniprot_best is None or resolution < current_uniprot_best[1]:
                 current_uniprot_best = (pdb_id, resolution)
                 print(f"  → Current best for {uniprot_id}: {pdb_id} ({resolution}Å)")
                 
-                # If we find a "Golden Ticket" (< 2.0 A), we stop EVERYTHING and return.
+                # Golden Ticket (< 2.0 A)
                 if resolution < 2.0:
                     print(f"\n✓ Found excellent structure (< 2.0Å): {pdb_id} ({resolution}Å)")
-                    print(f"Stopping search and downloading...")
                     pdb_path = download_pdb_file(pdb_id)
                     download_fasta_file(pdb_id)
                     if pdb_path:
                         return (pdb_id, pdb_path)
         
-        # End of Inner Loop (PDBs for one UniProt)
-        
-        # If we found a valid structure in this UniProt ID, compare it to the Overall Best
         if current_uniprot_best:
             if overall_best_candidate is None or current_uniprot_best[1] < overall_best_candidate[1]:
                 overall_best_candidate = current_uniprot_best
                 print(f"  ★ New Global Best Candidate: {overall_best_candidate[0]} ({overall_best_candidate[1]}Å)")
-            else:
-                print(f"  (Did not beat current global best: {overall_best_candidate[0]} at {overall_best_candidate[1]}Å)")
-        
-        # Continue to the next UniProt ID...
-        if uid_idx < len(uniprot_ids) - 1:
-            print("  Structure > 2.0Å. Continuing search in next UniProt class...")
-
-    # End of Outer Loop
     
-    # If we are here, we checked ALL UniProt IDs and didn't find a < 2.0Å structure.
-    # Return the best one we found overall.
     if overall_best_candidate:
         pdb_id, resolution = overall_best_candidate
-        print(f"\n✓ Search complete. No < 2.0Å structure found.")
-        print(f"Settling for best available: {pdb_id} ({resolution}Å)")
+        print(f"\n✓ Search complete. Returning best available: {pdb_id} ({resolution}Å)")
         
         pdb_path = download_pdb_file(pdb_id)
         download_fasta_file(pdb_id)
         if pdb_path:
             return (pdb_id, pdb_path)
     
-    print("\nNo suitable structure found across all UniProt candidates.")
-    return None
-
-
-def search_pdb_for_first_hit(protein_name: str) -> Optional[str]:
-    """Search RCSB PDB and return the first result found (legacy function)."""
-    result = find_best_pdb_structure(protein_name)
-    if result:
-        return result[0]
+    print("\nNo suitable structure found.")
     return None

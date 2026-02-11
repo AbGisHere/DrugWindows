@@ -10,9 +10,20 @@ import gradio as gr
 from config import current_pdb_info, PREPARED_PROTEIN_DIR
 from visualization import show_structure
 
+# Import Utils for the search logic
+import utils
+
+# Import the Ramachandran module (assumed filename: ramachandran.py)
+# This module contains the logic to check REMARK 465 and run Swiss-Model
+from ramachandran import run_ramplot
+
 
 def prepare_protein_meeko():
-    """Prepare protein using Meeko for docking."""
+    """
+    Prepare protein using Meeko for docking.
+    Includes robust retry logic: if preparation fails, it searches for a new PDB,
+    runs the validation/Swiss-Model pipeline, and tries again.
+    """
     
     # 1. Check for loaded structure
     if not current_pdb_info.get("pdb_id") or not current_pdb_info.get("pdb_path"):
@@ -22,10 +33,15 @@ def prepare_protein_meeko():
             gr.update(value=None)
         )
     
-    # 2. Identify Source File (Swiss-Model vs Original)
     pdb_path = current_pdb_info["pdb_path"]
     pdb_id = current_pdb_info["pdb_id"]
     
+    # --- CHECK FOR MISSING FILE ---
+    # If the file is missing, trigger retry immediately
+    if not os.path.exists(pdb_path):
+        yield from trigger_retry_pipeline(pdb_id, "File missing")
+        return
+
     is_swiss = "swiss_model" in os.path.basename(pdb_path)
     source_msg = "SWISS-MODEL Homology Structure" if is_swiss else "Original Crystal Structure"
     
@@ -41,7 +57,7 @@ def prepare_protein_meeko():
     
     output_base = os.path.join(output_dir, "prepared_protein")
     
-    # 3. Run Meeko
+    # 2. Run Meeko
     cmd = [  
         sys.executable, "mk_prepare_receptor.py", 
         "-i", pdb_path,
@@ -58,12 +74,12 @@ def prepare_protein_meeko():
         pdbqt_path = f"{output_base}.pdbqt"
         
         if not os.path.exists(pdbqt_path):
-            yield (
-                gr.update(value="<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ PDBQT file not generated</div>", visible=True),
-                gr.update(value=""),
-                gr.update(value=None)
-            )
+            # If Meeko failed to produce output, assume structure is bad -> RETRY
+            print(f"Meeko failed to generate PDBQT for {pdb_id}")
+            yield from trigger_retry_pipeline(pdb_id, "Meeko output generation failed")
             return
+        
+        # --- SUCCESS PATH ---
         
         # Store prepared protein path globally
         current_pdb_info["prepared_pdbqt"] = pdbqt_path
@@ -75,7 +91,6 @@ def prepare_protein_meeko():
         # Create 3D visualization
         protein_name = f"Prepared: {pdb_id} ({'Swiss-Model' if is_swiss else 'Original'})"
         
-        # UPDATED CALL: Pass pdbqt_content as protein_text, None as ligand_text
         structure_html = show_structure(
             protein_text=pdbqt_content, 
             ligand_text=None, 
@@ -101,17 +116,76 @@ def prepare_protein_meeko():
             gr.update(value=temp_file.name)
         )
         
-    except subprocess.CalledProcessError as e:
-        error_msg = f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>"
-        error_msg += f"⚠️ Preparation failed:<br><small>{e.stderr if e.stderr else str(e)}</small></div>"
-        yield (
-            gr.update(value=error_msg, visible=True),
-            gr.update(value=""),
-            gr.update(value=None)
-        )
+    except (subprocess.CalledProcessError, Exception) as e:
+        # Catch ANY failure during preparation and retry
+        print(f"Preparation failed for {pdb_id}. Reason: {e}")
+        yield from trigger_retry_pipeline(pdb_id, str(e))
+
+
+def trigger_retry_pipeline(failed_pdb_id, reason):
+    """
+    Helper generator to handle the retry logic:
+    1. Exclude failed PDB.
+    2. Search for next best PDB (Utils).
+    3. Validate and Model (Ramachandran/Swiss).
+    4. Recursively call Protein Prep.
+    """
+    
+    # 1. Initialize exclusion list if not present
+    if "failed_pdbs" not in current_pdb_info:
+        current_pdb_info["failed_pdbs"] = []
+    
+    # 2. Add current failure to list
+    if failed_pdb_id not in current_pdb_info["failed_pdbs"]:
+        current_pdb_info["failed_pdbs"].append(failed_pdb_id)
+    
+    fail_msg = f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>⚠️ Preparation failed for <b>{failed_pdb_id}</b> ({reason}).<br>🔄 <b>Retrying with next best structure...</b></div>"
+    
+    yield (
+        gr.update(value=fail_msg, visible=True),
+        gr.update(value=""),
+        gr.update(value=None)
+    )
+    
+    # 3. Retrieve original search term
+    search_term = current_pdb_info.get("search_term", "")
+    if not search_term:
+        yield (gr.update(value="❌ Retry failed: Could not recall search term."), gr.update(), gr.update())
+        return
+
+    # 4. Search for Next Best Candidate (Utils Step)
+    print(f"Retrying search for '{search_term}', excluding: {current_pdb_info['failed_pdbs']}")
+    new_result = utils.find_best_pdb_structure(
+        search_term, 
+        excluded_pdbs=current_pdb_info["failed_pdbs"]
+    )
+    
+    if not new_result:
+        yield (gr.update(value="❌ Retry failed: No other suitable structures found."), gr.update(), gr.update())
+        return
+        
+    new_pdb_id, new_pdb_path = new_result
+    
+    # Update Global Info with New PDB
+    current_pdb_info["pdb_id"] = new_pdb_id
+    current_pdb_info["pdb_path"] = new_pdb_path
+    
+    # 5. RERUN RAMACHANDRAN / SWISS MODEL PIPELINE
+    # This ensures the new PDB is checked for missing residues and modeled if necessary
+    try:
+        msg = f"Found new candidate: <b>{new_pdb_id}</b>. Running validation and Swiss-Model check..."
+        yield (gr.update(value=msg), gr.update(), gr.update())
+
+        print(f"Triggering Ramachandran/Swiss-Model check for {new_pdb_id}...")
+        
+        # We call the function from ramchandran.py
+        # This function updates current_pdb_info['pdb_path'] internally if Swiss-Model is generated
+        run_ramplot() 
+        
     except Exception as e:
-        yield (
-            gr.update(value=f"<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ Error: {str(e)}</div>", visible=True),
-            gr.update(value=""),
-            gr.update(value=None)
-        )
+        yield (gr.update(value=f"❌ Pipeline retry failed during structure validation: {e}"), gr.update(), gr.update())
+        return
+
+    # 6. RECURSIVE CALL TO PROTEIN PREP
+    # Now that we have a new PDB (and potentially new Swiss model), run prep again
+    yield from prepare_protein_meeko()

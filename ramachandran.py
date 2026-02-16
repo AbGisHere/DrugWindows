@@ -181,7 +181,27 @@ def run_swiss_model(fasta_path: str, pdb_id: str, progress_callback=None) -> str
         except Exception:
             time.sleep(poll_interval)
 
+def run_ramplot(progress=gr.Progress()):
+    """
+    Run Ramachandran plot analysis.
+    """
+    # 1. No structure case
+    if not current_pdb_info["pdb_id"] or not current_pdb_info["pdb_path"]:
+        return (
+            gr.update(value="<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ No structure loaded. Please search for a protein first.</div>", visible=True),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(visible=False)
+        )
 
+    # IMMEDIATELY show a loading indicator (This is handled by the .click event below, 
+    # but we ensure the status box is visible here)
+    
+    pdb_id = current_pdb_info["pdb_id"]
+    pdb_path = current_pdb_info["pdb_path"]
+    
+    # ... (rest of your existing logic: Swiss-Model, subprocess.run, etc.) ...
+    
 def run_ramplot(progress=gr.Progress()):
     """
     Run Ramachandran plot analysis.

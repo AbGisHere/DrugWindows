@@ -19,6 +19,23 @@ from admet_analysis import run_admet_prediction
 from utils import map_disease_to_protein, find_best_pdb_structure
 from visualization import show_structure
 
+def show_ram_loading():
+    """Immediately shows a loading state for the Ramachandran tab."""
+    return (
+        gr.update(value="""
+            <div style='padding: 20px; background: #e7f3ff; border-radius: 8px; color: #004085; border-left: 5px solid #007bff;'>
+                <div style='display: flex; align-items: center;'>
+                    <span style='margin-right: 10px; font-size: 1.5em;'>⏳</span>
+                    <strong>Analyzing Structural Geometry...</strong> 
+                </div>
+                <p style='margin-top: 10px; font-size: 0.9em;'>Checking for missing residues and generating 2D/3D Ramachandran Map types. This may take a moment if SWISS-MODEL homology modeling is required.</p>
+            </div>
+        """, visible=True),
+        gr.update(visible=False), gr.update(visible=False),
+        gr.update(visible=False), gr.update(visible=False),
+        gr.update(visible=False)
+    )
+
 def process_disease(user_input: str):
     """
     Main function to process disease/protein input.
@@ -489,7 +506,15 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
         ]
     )
     
-    ramplot_btn.click(fn=run_ramplot, inputs=[], outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats])
+    # Updated Ramachandran logic with Loading State
+    ramplot_btn.click(
+        fn=show_ram_loading, 
+        outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats]
+    ).then(
+        fn=run_ramplot, 
+        inputs=[], 
+        outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats]
+    )
     
     # CRITICAL: Prepare Button now updates Prep (3), Search (4), Ramplot (6) = 13 total
     prepare_btn.click(

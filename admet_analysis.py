@@ -19,7 +19,7 @@ from config import DOCKING_RESULTS_DIR
 # 1. CONFIGURATION
 # ==========================================
 
-# Updated column list to include "Chain" and "Pose"
+# Updated column list to include "Chain", "Pose" and Safety Flags for UI
 DISPLAY_COLUMNS = [
     "Filename",                # Identifier
     "Chain",                   # Chain ID
@@ -28,13 +28,16 @@ DISPLAY_COLUMNS = [
     "Pose",                    # NEW: Pose Number
     "Docking Score",           # Docking score (specific to pose)
     "Final Decision",          # Final decision
+    "Developability Score",    # Composite score
     "SA Score",                # SA score
     "QED",                     # QED
-    "hERG",                    # hERG
-    "Ames",                    # Ames
+    "Lipinski",                # Rule of 5 (Needed for UI Warnings)
+    "PAINS",                   # PAINS Filter (Needed for UI Warnings)
+    "Brenk",                   # Brenk Filter (Needed for UI Warnings)
+    "hERG",                    # hERG Toxicity
+    "Ames",                    # Ames Mutagenicity
     "CYP3A4 Inhibition",       # CYP Flags (Part 1)
     "CYP2D6 Inhibition",       # CYP Flags (Part 2)
-    "Developability Score"     # Composite score
 ]
 
 # ==========================================

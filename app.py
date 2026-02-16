@@ -2,6 +2,7 @@
 """
 Main Gradio interface for Protein Structure Finder & Analyzer
 Updated version: Wires Protein Prep to update all tabs on retry.
+Includes custom White-Themed UI for ADMET Analysis.
 """
 
 import os
@@ -19,6 +20,10 @@ from admet_analysis import run_admet_prediction
 from utils import map_disease_to_protein, find_best_pdb_structure
 from visualization import show_structure
 
+# ==========================================
+# 1. HELPER FUNCTIONS
+# ==========================================
+
 def show_ram_loading():
     """Immediately shows a loading state for the Ramachandran tab."""
     return (
@@ -35,6 +40,264 @@ def show_ram_loading():
         gr.update(visible=False), gr.update(visible=False),
         gr.update(visible=False)
     )
+
+def render_admet_cards(df):
+    """
+    Converts the ADMET DataFrame into a responsive HTML grid of cards.
+    Style: White background cards with detailed property grids.
+    """
+    if df is None or df.empty:
+        return "<div style='padding:20px; text-align:center; color:#888;'>No data available to render.</div>"
+
+    cards_html = """
+    <style>
+        .admet-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 24px;
+            padding: 10px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .admet-card {
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            transition: all 0.2s ease;
+            color: #1f2937;
+            display: flex;
+            flex-direction: column;
+        }
+        .admet-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            border-color: #d1d5db;
+        }
+        
+        /* Header Section */
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .ligand-info h3 {
+            font-size: 1.25em;
+            font-weight: 700;
+            color: #111827;
+            margin: 0 0 4px 0;
+            line-height: 1.2;
+        }
+        .ligand-sub {
+            font-size: 0.85em;
+            color: #6b7280;
+            font-weight: 500;
+        }
+        
+        /* Decision Badge */
+        .badge {
+            font-size: 0.75em;
+            padding: 6px 10px;
+            border-radius: 9999px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .badge-green { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .badge-red { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .badge-yellow { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+        
+        /* Progress Bars */
+        .bar-section {
+            background: #f9fafb;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #f3f4f6;
+            margin-bottom: 16px;
+        }
+        .bar-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 0.85em;
+        }
+        .bar-row:last-child { margin-bottom: 0; }
+        .bar-label {
+            width: 95px;
+            color: #4b5563;
+            font-weight: 600;
+        }
+        .bar-track {
+            flex-grow: 1;
+            height: 8px;
+            background: #e5e7eb;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 0 12px;
+        }
+        .bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+        .bar-val {
+            width: 45px;
+            text-align: right;
+            font-weight: bold;
+            color: #1f2937;
+        }
+
+        /* Properties Grid */
+        .props-container {
+            margin-top: auto;
+        }
+        .props-title {
+            font-size: 0.75em;
+            text-transform: uppercase;
+            color: #9ca3af;
+            font-weight: 700;
+            margin-bottom: 8px;
+            letter-spacing: 0.05em;
+        }
+        .props-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+        }
+        .prop-tag {
+            background: #f3f4f6;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 0.8em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #e5e7eb;
+        }
+        .prop-name { color: #6b7280; font-weight: 500; }
+        .prop-value { color: #111827; font-weight: 700; }
+        
+        /* Conditional Formatting for Property Values */
+        .val-bad { color: #dc2626; }
+        .val-good { color: #059669; }
+        .val-warn { color: #d97706; }
+    </style>
+    <div class="admet-grid">
+    """
+
+    for _, row in df.iterrows():
+        # 1. Basic Info
+        ligand = str(row.get('Ligand', 'Unknown'))
+        pocket = str(row.get('Pocket', 'Unknown'))
+        chain = str(row.get('Chain', '?'))
+        pose = str(row.get('Pose', '1'))
+        
+        # 2. Scores & Logic
+        docking_score = row.get('Docking Score', 0)
+        dev_score = row.get('Developability Score', 0)
+        decision = str(row.get('Final Decision', 'REVIEW'))
+
+        # 3. Badge Logic
+        if "ACCEPT" in decision.upper():
+            badge_class = "badge-green"
+            badge_text = "ACCEPTED"
+        elif "REJECT" in decision.upper():
+            badge_class = "badge-red"
+            badge_text = "REJECTED"
+        else:
+            badge_class = "badge-yellow"
+            badge_text = "REVIEW"
+
+        # 4. Bar Visuals
+        try:
+            ds_val = float(docking_score)
+            ds_width = min(100, max(0, (abs(ds_val) - 4) / 8 * 100))
+        except: ds_val, ds_width = 0, 0
+        
+        try:
+            dev_val = float(dev_score)
+            dev_width = min(100, max(0, dev_val))
+        except: dev_val, dev_width = 0, 0
+
+        # 5. Extract Details for Grid
+        # Helper to safely get string
+        def get_val(key): return str(row.get(key, '-'))
+
+        props_list = [
+            ("SA Score", get_val('SA Score')),
+            ("QED", get_val('QED')),
+            ("Lipinski", get_val('Lipinski')),
+            ("PAINS", get_val('PAINS')),
+            ("Brenk", get_val('Brenk')),
+            ("hERG", get_val('hERG')),
+            ("Ames", get_val('Ames')),
+            ("CYP3A4", get_val('CYP3A4 Inhibition')),
+            ("CYP2D6", get_val('CYP2D6 Inhibition'))
+        ]
+
+        # 6. Build Grid HTML
+        grid_html = ""
+        for name, val in props_list:
+            # Simple color coding for obvious yes/no risks
+            val_class = ""
+            if val in ['Yes', 'High', 'Positive', 'Fail']: val_class = "val-bad"
+            elif val in ['No', 'Low', 'Negative', 'Pass']: val_class = "val-good"
+            
+            grid_html += f"""
+            <div class="prop-tag">
+                <span class="prop-name">{name}</span>
+                <span class="prop-value {val_class}">{val}</span>
+            </div>
+            """
+
+        # 7. Assemble Card
+        card = f"""
+        <div class="admet-card">
+            <div class="card-header">
+                <div class="ligand-info">
+                    <h3>{ligand}</h3>
+                    <div class="ligand-sub">Chain {chain} • {pocket} • Pose {pose}</div>
+                </div>
+                <div class="{badge_class} badge">{badge_text}</div>
+            </div>
+            
+            <div class="bar-section">
+                <div class="bar-row">
+                    <span class="bar-label">Binding</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" style="width: {ds_width}%; background: #3b82f6;"></div>
+                    </div>
+                    <span class="bar-val">{ds_val:.2f}</span>
+                </div>
+                <div class="bar-row">
+                    <span class="bar-label">Dev Score</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" style="width: {dev_width}%; background: #8b5cf6;"></div>
+                    </div>
+                    <span class="bar-val">{int(dev_val)}</span>
+                </div>
+            </div>
+            
+            <div class="props-container">
+                <div class="props-title">Molecular Properties</div>
+                <div class="props-grid">
+                    {grid_html}
+                </div>
+            </div>
+        </div>
+        """
+        cards_html += card
+
+    cards_html += "</div>"
+    return cards_html
+
+# ==========================================
+# 2. LOGIC HANDLERS
+# ==========================================
 
 def process_disease(user_input: str):
     """
@@ -329,28 +592,37 @@ def visualize_docking_result(selection_value: str, summary_df: pd.DataFrame):
         return f"❌ Visualization Error: {str(e)}", None
 
 def process_admet():
+    """Run ADMET analysis and render the result as UI Cards."""
     try:
         result = run_admet_prediction()
         if result is None:
             return {
                 admet_status: gr.update(value="❌ Analysis Failed.", visible=True),
-                admet_table: gr.update(visible=False),
+                admet_results_view: gr.update(visible=False), 
                 admet_download: gr.update(visible=False)
             }
+        
         msg, df, csv_path = result
+        
+        # Render the custom HTML Cards
+        html_view = render_admet_cards(df)
+        
         return {
             admet_status: gr.update(value=f"✅ {msg}", visible=True),
-            admet_table: gr.update(value=df, visible=True),
+            admet_results_view: gr.update(value=html_view, visible=True),
             admet_download: gr.update(value=csv_path, visible=True)
         }
     except Exception as e:
         return {
             admet_status: gr.update(value=f"❌ System Error: {str(e)}", visible=True),
-            admet_table: gr.update(visible=False),
+            admet_results_view: gr.update(visible=False),
             admet_download: gr.update(visible=False)
         }
 
-# UI Layout
+# ==========================================
+# 3. UI LAYOUT
+# ==========================================
+
 with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyzer") as demo:
     
     gr.HTML("<div class='main-header'><h1>🧬 Protein Structure Finder & Analyzer</h1></div>")
@@ -457,13 +729,19 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
                 prev_btn_4 = gr.Button("← Previous", variant="secondary")
                 next_btn_4 = gr.Button("Next: ADMET →", variant="primary")
 
-        # Tab 6: ADMET
+        # Tab 6: ADMET Analysis
         with gr.Tab("🧪 ADMET Analysis", id=6):
-            gr.Markdown("### Drug-likeness & Safety")
-            admet_btn = gr.Button("Run ADMET", variant="secondary")
+            gr.Markdown("### Drug-likeness & Safety Screening")
+            
+            with gr.Row():
+                admet_btn = gr.Button("🚀 Run ADMET Analysis", variant="primary")
+                admet_download = gr.File(label="Download CSV Report", visible=False)
+            
             admet_status = gr.Markdown(visible=False)
-            admet_download = gr.File(visible=False)
-            admet_table = gr.Dataframe(visible=False)
+            
+            # Using HTML component for custom White-Card UI
+            admet_results_view = gr.HTML(label="Analysis Results", visible=True)
+            
             with gr.Row():
                 prev_btn_5 = gr.Button("← Previous", variant="secondary")
                 next_btn_5 = gr.Button("Back to Start", variant="primary")
@@ -478,8 +756,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
     next_btn_2.click(lambda: gr.Tabs(selected=3), None, tabs) 
     
     prev_btn_3.click(lambda: gr.Tabs(selected=2), None, tabs)
-    next_btn_3.click(lambda: gr.Tabs(selected=4), None, tabs) # PrankWeb -> Ligand
-
+    next_btn_3.click(lambda: gr.Tabs(selected=4), None, tabs) 
+    
     # Ligand Analysis Events
     prev_btn_lig.click(lambda: gr.Tabs(selected=3), None, tabs)
     next_btn_lig.click(lambda: gr.Tabs(selected=5), None, tabs)
@@ -487,7 +765,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
     ligand_selector.change(fn=visualize_ligand_only, inputs=[ligand_selector], outputs=[ligand_viewer])
     
     # Docking Navigation
-    prev_btn_4.click(lambda: gr.Tabs(selected=4), None, tabs) # Docking -> Ligand
+    prev_btn_4.click(lambda: gr.Tabs(selected=4), None, tabs)
     next_btn_4.click(lambda: gr.Tabs(selected=6), None, tabs)
     
     # ADMET Navigation
@@ -501,8 +779,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
         fn=process_disease, 
         inputs=[disease_input], 
         outputs=[
-            info_box, structure_viewer, download_file, search_status,  # Search Tab
-            ramplot_status, ramplot_stats, plot1, plot2, plot3, plot4  # Ramachandran Tab (Cleared)
+            info_box, structure_viewer, download_file, search_status,   # Search Tab
+            ramplot_status, ramplot_stats, plot1, plot2, plot3, plot4   # Ramachandran Tab (Cleared)
         ]
     )
     
@@ -516,18 +794,13 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
         outputs=[ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats]
     )
     
-    # CRITICAL: Prepare Button now updates Prep (3), Search (4), Ramplot (6) = 13 total
+    # Prepare Button
     prepare_btn.click(
         fn=prepare_protein_meeko, 
         inputs=[], 
         outputs=[
-            # Tab 2: Protein Prep (3 outputs)
             prepare_status, prepared_viewer, prepared_download,
-            
-            # Tab 0: Search (4 outputs)
             info_box, structure_viewer, download_file, search_status,
-            
-            # Tab 1: Ramachandran (6 outputs)
             ramplot_status, plot1, plot2, plot3, plot4, ramplot_stats
         ]
     )
@@ -545,7 +818,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
         outputs=[docked_viewer, docking_report_area]
     )
     
-    admet_btn.click(fn=process_admet, inputs=[], outputs={admet_status, admet_table, admet_download})
+    # ADMET Logic Connection
+    admet_btn.click(fn=process_admet, inputs=[], outputs={admet_status, admet_results_view, admet_download})
 
 if __name__ == "__main__":
     # JavaScript to force dark mode on load

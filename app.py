@@ -2,7 +2,7 @@
 """
 Main Gradio interface for Protein Structure Finder & Analyzer
 Updated version: Wires Protein Prep to update all tabs on retry.
-Includes custom White-Themed UI for ADMET Analysis.
+Includes custom White-Themed UI for ADMET Analysis with Top 5 Filtering.
 """
 
 import os
@@ -45,9 +45,42 @@ def render_admet_cards(df):
     """
     Converts the ADMET DataFrame into a responsive HTML grid of cards.
     Style: White background cards with detailed property grids.
+    Logic: Filters for Top 5 per Ligand + All Non-Rejected.
     """
     if df is None or df.empty:
         return "<div style='padding:20px; text-align:center; color:#888;'>No data available to render.</div>"
+
+    # --- Filtering Logic: Top 5 per Ligand ---
+    filtered_rows = []
+    
+    # Group by Ligand Name
+    if 'Ligand' in df.columns:
+        grouped = df.groupby('Ligand')
+        for ligand, group in grouped:
+            # Sort by Developability Score (Desc) then Docking Score (Asc - more negative is better)
+            # Note: Docking Score is usually negative, so 'Ascending' means best binding first.
+            group_sorted = group.sort_values(
+                by=['Developability Score', 'Docking Score'], 
+                ascending=[False, True]
+            )
+            
+            # Take Top 5
+            top_5 = group_sorted.head(5)
+            
+            # Also include ANY that are NOT rejected (if not already in top 5)
+            non_rejected = group_sorted[~group_sorted['Final Decision'].astype(str).str.contains("REJECT", case=False, na=False)]
+            
+            # Combine and drop duplicates
+            combined = pd.concat([top_5, non_rejected]).drop_duplicates()
+            
+            filtered_rows.append(combined)
+        
+        if filtered_rows:
+            df_to_render = pd.concat(filtered_rows).sort_values(by=['Developability Score'], ascending=False)
+        else:
+            df_to_render = df # Fallback
+    else:
+        df_to_render = df
 
     cards_html = """
     <style>
@@ -189,7 +222,7 @@ def render_admet_cards(df):
     <div class="admet-grid">
     """
 
-    for _, row in df.iterrows():
+    for _, row in df_to_render.iterrows():
         # 1. Basic Info
         ligand = str(row.get('Ligand', 'Unknown'))
         pocket = str(row.get('Pocket', 'Unknown'))
@@ -599,7 +632,8 @@ def process_admet():
             return {
                 admet_status: gr.update(value="❌ Analysis Failed.", visible=True),
                 admet_results_view: gr.update(visible=False), 
-                admet_download: gr.update(visible=False)
+                admet_download: gr.update(visible=False),
+                admet_table: gr.update(visible=False)
             }
         
         msg, df, csv_path = result
@@ -609,14 +643,16 @@ def process_admet():
         
         return {
             admet_status: gr.update(value=f"✅ {msg}", visible=True),
-            admet_results_view: gr.update(value=html_view, visible=True),
+            admet_table: gr.update(value=df, visible=True), # Table first
+            admet_results_view: gr.update(value=html_view, visible=True), # Cards second
             admet_download: gr.update(value=csv_path, visible=True)
         }
     except Exception as e:
         return {
             admet_status: gr.update(value=f"❌ System Error: {str(e)}", visible=True),
             admet_results_view: gr.update(visible=False),
-            admet_download: gr.update(visible=False)
+            admet_download: gr.update(visible=False),
+            admet_table: gr.update(visible=False)
         }
 
 # ==========================================
@@ -739,8 +775,11 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
             
             admet_status = gr.Markdown(visible=False)
             
-            # Using HTML component for custom White-Card UI
-            admet_results_view = gr.HTML(label="Analysis Results", visible=True)
+            # Table CSV Data displayed first
+            admet_table = gr.Dataframe(label="Detailed Report", visible=True)
+            
+            # HTML Cards displayed second
+            admet_results_view = gr.HTML(label="Analysis Cards", visible=True)
             
             with gr.Row():
                 prev_btn_5 = gr.Button("← Previous", variant="secondary")
@@ -818,8 +857,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Protein Structure Finder & Analyze
         outputs=[docked_viewer, docking_report_area]
     )
     
-    # ADMET Logic Connection
-    admet_btn.click(fn=process_admet, inputs=[], outputs={admet_status, admet_results_view, admet_download})
+    # ADMET Logic Connection - Updated outputs (4 items)
+    admet_btn.click(
+        fn=process_admet, 
+        inputs=[], 
+        outputs={admet_status, admet_table, admet_results_view, admet_download}
+    )
 
 if __name__ == "__main__":
     # JavaScript to force dark mode on load

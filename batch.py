@@ -41,7 +41,7 @@ from ligand_analysis import run_ligand_classification
 from prankweb import run_prankweb_prediction
 from protein_prep import prepare_protein_meeko
 from ramachandran import run_ramplot
-from utils import find_best_pdb_structure, map_disease_to_protein
+from utils import find_best_pdb_structure
 
 
 PIPELINE_STEPS = [
@@ -150,7 +150,7 @@ class ProteinPipelineBatch:
         protein_dir = self._protein_dir(protein_input)
 
         # 1) Structure search
-        protein_name = map_disease_to_protein(protein_input) or protein_input.strip()
+        protein_name = protein_input.strip()
         search = find_best_pdb_structure(protein_name, max_check=100)
         if not search:
             result["steps"]["structure_search"] = {"status": "failed", "error": "No suitable structure found"}

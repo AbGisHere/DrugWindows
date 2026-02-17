@@ -11,6 +11,7 @@ UPDATED FEATURES:
 """
 
 import os
+import subprocess
 import json
 import shutil
 from pathlib import Path
@@ -33,6 +34,22 @@ from docking import run_molecular_docking
 from admet_analysis import run_admet_prediction
 from utils import map_disease_to_protein, find_best_pdb_structure
 
+
+# --- HELPER FUNCTIONS ---
+def update_dft_script_file(new_pdb_path):
+    """Safely rewrites the PDB_FILE line in dft.py to point to the selected pose."""
+    script_path = "dft.py"
+    if not os.path.exists(script_path):
+        raise FileNotFoundError("dft.py not found in current directory.")
+        
+    with open(script_path, "r") as f: lines = f.readlines()
+    
+    with open(script_path, "w") as f:
+        for line in lines:
+            if line.strip().startswith("PDB_FILE ="):
+                f.write(f"PDB_FILE = {repr(str(new_pdb_path))}\n")
+            else:
+                f.write(line)
 
 # --- VISUALIZATION FUNCTION ---
 def show_structure(protein_text: str, ligand_text: str = None, pdb_id: str = "Docking Result", protein_name: str = "") -> str:
@@ -149,7 +166,8 @@ class ProteinPipelineBatch:
             "04_binding_site_prediction", 
             "05_ligand_analysis",     
             "06_molecular_docking",   
-            "07_admet_analysis"       
+            "07_admet_analysis",
+            "08_dft_analysis"       
         ]
         step_dirs = {}
         for step in steps:
@@ -566,6 +584,90 @@ class ProteinPipelineBatch:
                 print(f"✅ ADMET results saved.")
                 return {"status": "success", "message": msg}
         return {"status": "failed"}
+
+    # --- STEP 8: DFT ANALYSIS ---
+    def process_dft_analysis(self, step_dir, docking_dir):
+        """Step 8: Run DFT Analysis on all docked compounds."""
+        print(f"\nSTEP 8: DFT Analysis")
+        
+        # 1. Find all docked PDBs from the docking step
+        # docking_dir is the Path object for "06_molecular_docking"
+        docked_pdbs = list(docking_dir.glob("*_complex.pdb"))
+        
+        if not docked_pdbs:
+            print("  ⚠️ No docked complex PDB files found for DFT analysis.")
+            return {"status": "skipped", "reason": "no_docked_files"}
+            
+        print(f"  Found {len(docked_pdbs)} complexes to analyze.")
+        
+        # CSV Cleanup specifically for this run's context, though we are in a batch script.
+        # We will collect results in a list and save to the step_dir.
+        
+        batch_results = []
+        dft_script_path = "dft.py"
+        
+        if not os.path.exists(dft_script_path):
+             print(f"  ❌ dft.py not found.")
+             return {"status": "failed", "error": "dft.py missing"}
+
+        # Clear single run output to avoid reading stale data from previous manual runs
+        single_csv = "orca_electronic_metrics.csv"
+        if os.path.exists(single_csv): os.remove(single_csv)
+
+        for i, pdb_path in enumerate(docked_pdbs):
+            pdb_name = pdb_path.name
+            print(f"  [{i+1}/{len(docked_pdbs)}] Processing DFT for: {pdb_name}")
+            
+            # 1. Update Script
+            try:
+                # We must use absolute path for the dft script to find it
+                update_dft_script_file(pdb_path.resolve())
+            except Exception as e:
+                print(f"    ❌ Failed to update script: {e}")
+                continue
+            
+            # 2. Run Subprocess (Switch Env)
+            # This child process runs in orca_env, then dies. 
+            # We assume 'conda activate' or similar isn't strictly available as a simple executable 
+            # unless we use the shell.
+            # Mirroring app.py command: 'cmd /c "call activate orca_env && python dft.py"'
+            
+            command = f'cmd /c "call activate orca_env && python dft.py"'
+            try:
+                # Run with timeout to prevent hanging? dft can be slow. 
+                # Let's assume user wants to wait.
+                process = subprocess.run(command, capture_output=True, text=True, shell=True)
+                if process.returncode != 0:
+                    print(f"    ⚠️ Error executing dft.py: {process.stderr.strip()}")
+                else:
+                    # check stdout for specific errors if needed
+                    pass
+            except Exception as e:
+                print(f"    ❌ Execution error: {e}")
+            
+            # 3. Read Single Result
+            # dft.py writes to "orca_electronic_metrics.csv" in the CWD (project root).
+            if os.path.exists(single_csv):
+                try:
+                    df = pd.read_csv(single_csv)
+                    if not df.empty:
+                        last_row = df.iloc[-1].to_dict()
+                        # Ensure filename matches what we just ran
+                        # dft.py saves the filename, but let's be sure or just use it.
+                        batch_results.append(last_row)
+                except Exception as e:
+                    print(f"    ⚠️ Failed to read results: {e}")
+        
+        # Save aggregated results
+        if batch_results:
+            results_df = pd.DataFrame(batch_results)
+            csv_path = step_dir / "dft_batch_results.csv"
+            results_df.to_csv(csv_path, index=False)
+            print(f"  ✅ DFT Batch Analysis complete. Saved {len(results_df)} results.")
+            return {"status": "success", "count": len(results_df), "csv_path": str(csv_path)}
+        else:
+            print("  ⚠️ No DFT results were generated.")
+            return {"status": "failed", "reason": "no_results_generated"}
     
     # --- PIPELINE CONTROLLER ---
     def process_single_protein(self, protein_input):
@@ -604,6 +706,15 @@ class ProteinPipelineBatch:
         
         # 7. ADMET
         pipeline_results["steps"]["admet"] = self.process_admet(step_dirs["07_admet_analysis"])
+
+        # 8. DFT Analysis (NEW)
+        # We need to pass the docking results from step 6 (or the folder) to this step
+        # However, the process_dft_analysis method will likely scan the docking folder itself or receive the list of PDBs.
+        # Let's start by modifying create_protein_folders to include step 8.
+        pipeline_results["steps"]["dft_analysis"] = self.process_dft_analysis(
+            step_dirs["08_dft_analysis"], 
+            step_dirs["06_molecular_docking"]
+        )
         
         pipeline_results["pipeline_status"] = "completed"
         pipeline_results["end_time"] = datetime.now().isoformat()
@@ -689,5 +800,5 @@ if __name__ == "__main__":
 ]
 
 
-    batch_processor = ProteinPipelineBatch(output_base_dir="FDA_New_drugs2")
+    batch_processor = ProteinPipelineBatch(output_base_dir="New_pipeline")
     results = batch_processor.run_batch(protein_list)

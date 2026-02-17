@@ -1,12 +1,15 @@
 """
 Protein preparation module using Meeko
-Updated: Handles UI updates for Search (Tab 1) and Ramachandran (Tab 2) on retry.
+Updated: 
+1. Handles UI updates for Search (Tab 1) and Ramachandran (Tab 2) on retry.
+2. Clears the output directory before every run to prevent file accumulation.
 """
 
 import os
 import subprocess
 import sys
 import tempfile
+import shutil  # Added for directory cleaning
 import gradio as gr
 from config import current_pdb_info, PREPARED_PROTEIN_DIR
 from visualization import show_structure
@@ -88,6 +91,21 @@ def prepare_protein_meeko():
     ) + no_change(10)
     
     output_dir = PREPARED_PROTEIN_DIR
+
+    # --- CLEANUP: Delete everything in the folder before starting ---
+    if os.path.exists(output_dir):
+        print(f"Cleaning previous data in {output_dir}...")
+        for filename in os.listdir(output_dir):
+            file_path = os.path.join(output_dir, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f"Failed to delete {file_path}. Reason: {e}")
+    
+    # Re-create the directory to ensure it exists
     os.makedirs(output_dir, exist_ok=True)
     output_base = os.path.join(output_dir, "prepared_protein")
     
@@ -198,4 +216,5 @@ def trigger_retry_pipeline(failed_pdb_id, reason):
     ) + search_updates + ram_updates
 
     # 5. RECURSIVE CALL (Run Prep on new file)
+    # The new call will trigger the CLEANUP block again, ensuring the folder is clear for the new ID
     yield from prepare_protein_meeko()

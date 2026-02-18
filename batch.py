@@ -147,6 +147,28 @@ def save_3d_viewer_screenshot(iframe_html: str, output_png: Path) -> bool:
         return False
 
 
+def _extract_pose_text_from_pdbqt(pdbqt_path: Path, pose_number: int) -> str:
+    """Return only the requested MODEL block from a multi-model PDBQT file."""
+    if not pdbqt_path.exists():
+        return ""
+
+    lines = pdbqt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    in_model = False
+    model_lines: List[str] = []
+    for line in lines:
+        if line.startswith("MODEL"):
+            try:
+                in_model = int(line.split()[1]) == pose_number
+            except Exception:
+                in_model = False
+        if in_model:
+            model_lines.append(line)
+        if in_model and line.startswith("ENDMDL"):
+            break
+
+    return "".join(model_lines) if model_lines else "".join(lines)
+
+
 class ProteinPipelineBatch:
     def __init__(self, output_base_dir: str = "batch_results", run_dft: bool = False):
         self.output_base_dir = Path(output_base_dir)
@@ -306,39 +328,48 @@ class ProteinPipelineBatch:
                     shutil.rmtree(dst_tree)
                 shutil.copytree(DOCKING_RESULTS_DIR, dst_tree)
 
-            # Screenshot top docked pose
+            # Screenshots: one overall top pose + one top pose per chain
             if isinstance(docking_df, pd.DataFrame) and not docking_df.empty:
                 try:
-                    top = docking_df.sort_values(by="binding_energy", ascending=True).iloc[0]
-                    receptor_path = str(top.get("receptor_pdb_file") or current_pdb_info.get("pdb_path"))
-                    ligand_path = str(top.get("pdb_file"))
-                    pose_num = int(top.get("pose_number", 1))
+                    screenshot_rows = [
+                        ("top_pose_3d.png", docking_df.sort_values(by="binding_energy", ascending=True).iloc[0])
+                    ]
 
-                    protein_text = Path(receptor_path).read_text(encoding="utf-8", errors="ignore") if os.path.exists(receptor_path) else ""
-                    ligand_text = ""
-                    if os.path.exists(ligand_path):
-                        lines = Path(ligand_path).read_text(encoding="utf-8", errors="ignore").splitlines(True)
-                        in_model = False
-                        model_lines: List[str] = []
-                        for line in lines:
-                            if line.startswith("MODEL"):
-                                try:
-                                    in_model = int(line.split()[1]) == pose_num
-                                except Exception:
-                                    in_model = False
-                            if in_model:
-                                model_lines.append(line)
-                            if in_model and line.startswith("ENDMDL"):
-                                break
-                        ligand_text = "".join(model_lines) if model_lines else "".join(lines)
+                    if "chain" in docking_df.columns:
+                        for chain_name, chain_df in docking_df.groupby("chain", dropna=True):
+                            if chain_df.empty:
+                                continue
+                            safe_chain = "".join(c if str(c).isalnum() or c in "-_" else "_" for c in str(chain_name))
+                            screenshot_rows.append(
+                                (f"{safe_chain}_top_pose_3d.png", chain_df.sort_values(by="binding_energy", ascending=True).iloc[0])
+                            )
 
-                    if protein_text and ligand_text:
-                        dock_iframe = show_structure(protein_text=protein_text, ligand_text=ligand_text, pdb_id="Docking", protein_name=str(top.get("ligand", "Ligand")))
-                        save_3d_viewer_screenshot(dock_iframe, step6_dir / "top_pose_3d.png")
+                    saved_screenshots: List[str] = []
+                    for screenshot_name, pose_row in screenshot_rows:
+                        receptor_path = str(pose_row.get("receptor_pdb_file") or current_pdb_info.get("pdb_path"))
+                        ligand_path = Path(str(pose_row.get("pdb_file", "")))
+                        pose_num = int(pose_row.get("pose_number", 1))
+
+                        protein_text = Path(receptor_path).read_text(encoding="utf-8", errors="ignore") if receptor_path and os.path.exists(receptor_path) else ""
+                        ligand_text = _extract_pose_text_from_pdbqt(ligand_path, pose_num)
+
+                        if protein_text and ligand_text:
+                            dock_iframe = show_structure(
+                                protein_text=protein_text,
+                                ligand_text=ligand_text,
+                                pdb_id="Docking",
+                                protein_name=str(pose_row.get("ligand", "Ligand")),
+                            )
+                            if save_3d_viewer_screenshot(dock_iframe, step6_dir / screenshot_name):
+                                saved_screenshots.append(str(step6_dir / screenshot_name))
                 except Exception:
                     pass
 
-            result["steps"]["docking"] = {"status": "success" if docking_csv else "failed", "csv": docking_csv}
+            result["steps"]["docking"] = {
+                "status": "success" if docking_csv else "failed",
+                "csv": docking_csv,
+                "screenshots": saved_screenshots if 'saved_screenshots' in locals() else [],
+            }
         except Exception as exc:
             result["steps"]["docking"] = {"status": "failed", "error": str(exc)}
 

@@ -10,18 +10,20 @@ Pipeline order per protein:
 7) ADMET
 8) Optional DFT batch
 
-Notes:
-- This batch runner intentionally does not generate screenshots.
-- Selenium/webdriver dependencies are not used here.
+This backend stores every key CSV and generated screenshot under:
+<root>/<protein>/<step_folder>/...
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -29,20 +31,14 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from admet_analysis import run_admet_prediction
-from config import (
-    DOCKING_RESULTS_DIR,
-    LIGAND_DIR,
-    PRANKWEB_OUTPUT_DIR,
-    RAMPLOT_OUTPUT_DIR,
-    current_pdb_info,
-)
+from config import DOCKING_RESULTS_DIR, LIGAND_DIR, PRANKWEB_OUTPUT_DIR, RAMPLOT_OUTPUT_DIR, current_pdb_info
 from docking import run_molecular_docking
 from ligand_analysis import run_ligand_classification
 from prankweb import run_prankweb_prediction
 from protein_prep import prepare_protein_meeko
 from ramachandran import run_ramplot
 from utils import find_best_pdb_structure
-
+from visualization import show_structure
 
 PIPELINE_STEPS = [
     ("01_structure_search", "Structure Search"),
@@ -86,7 +82,6 @@ def _update_dft_script_file(new_pdb_path: str) -> None:
 
     with open(script_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-
     with open(script_path, "w", encoding="utf-8") as f:
         for line in lines:
             if line.strip().startswith("PDB_FILE ="):
@@ -102,6 +97,54 @@ def parse_protein_lines(raw_text: str) -> List[str]:
         if value and not value.startswith("#"):
             proteins.append(value)
     return proteins
+
+
+def _extract_iframe_html(iframe_html: str) -> Optional[str]:
+    if not iframe_html:
+        return None
+    match = re.search(r'src="data:text/html;base64,([^"]+)"', iframe_html)
+    if not match:
+        return None
+    try:
+        return base64.b64decode(match.group(1)).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def save_3d_viewer_screenshot(iframe_html: str, output_png: Path) -> bool:
+    """Save a screenshot of the generated 3Dmol HTML via selenium/chromedriver."""
+    html_content = _extract_iframe_html(iframe_html)
+    if not html_content:
+        return False
+
+    tmp_html = output_png.with_suffix(".html")
+    tmp_html.write_text(html_content, encoding="utf-8")
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.common.by import By
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+
+        driver = webdriver.Chrome(options=options)
+        driver.get(f"file://{tmp_html.absolute()}")
+        time.sleep(6)
+
+        try:
+            canvas = driver.find_element(By.TAG_NAME, "canvas")
+            canvas.screenshot(str(output_png))
+        except Exception:
+            driver.save_screenshot(str(output_png))
+        driver.quit()
+        return output_png.exists()
+    except Exception:
+        return False
 
 
 class ProteinPipelineBatch:
@@ -137,16 +180,11 @@ class ProteinPipelineBatch:
             step_dir = protein_dir / step_key
             if not step_dir.exists():
                 continue
-            items = [str(p.relative_to(protein_dir)) for p in sorted(step_dir.rglob("*")) if p.is_file()]
-            step_files[step_key] = items
+            step_files[step_key] = [str(p.relative_to(protein_dir)) for p in sorted(step_dir.rglob("*")) if p.is_file()]
         return step_files
 
     def process_single_protein(self, protein_input: str) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
-            "protein_input": protein_input,
-            "start_time": datetime.now().isoformat(),
-            "steps": {},
-        }
+        result: Dict[str, Any] = {"protein_input": protein_input, "start_time": datetime.now().isoformat(), "steps": {}}
         protein_dir = self._protein_dir(protein_input)
 
         # 1) Structure search
@@ -161,26 +199,25 @@ class ProteinPipelineBatch:
             return result
 
         pdb_id, pdb_path = search
-        current_pdb_info.update(
-            {
-                "pdb_id": pdb_id,
-                "pdb_path": pdb_path,
-                "prepared_pdbqt": None,
-                "docking_results": None,
-                "prankweb_csv": None,
-                "combined_csv": None,
-                "search_term": protein_name,
-            }
-        )
+        current_pdb_info.update({
+            "pdb_id": pdb_id,
+            "pdb_path": pdb_path,
+            "prepared_pdbqt": None,
+            "docking_results": None,
+            "prankweb_csv": None,
+            "combined_csv": None,
+            "search_term": protein_name,
+        })
 
         step1_dir = protein_dir / "01_structure_search"
         _safe_copy(pdb_path, step1_dir / f"{pdb_id}.pdb")
-        result["steps"]["structure_search"] = {
-            "status": "success",
-            "protein_name": protein_name,
-            "pdb_id": pdb_id,
-            "pdb_path": pdb_path,
-        }
+        try:
+            with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
+                structure_iframe = show_structure(protein_text=f.read(), ligand_text=None, pdb_id=pdb_id, protein_name=protein_name)
+            save_3d_viewer_screenshot(structure_iframe, step1_dir / f"{pdb_id}_structure.png")
+        except Exception:
+            pass
+        result["steps"]["structure_search"] = {"status": "success", "protein_name": protein_name, "pdb_id": pdb_id, "pdb_path": pdb_path}
 
         # 2) Ramachandran
         step2_dir = protein_dir / "02_ramachandran"
@@ -188,10 +225,12 @@ class ProteinPipelineBatch:
             ram_out = run_ramplot()
             ram_status = _extract_update_value(ram_out[0]) if isinstance(ram_out, tuple) and ram_out else str(ram_out)
             if os.path.exists(RAMPLOT_OUTPUT_DIR):
-                for name in os.listdir(RAMPLOT_OUTPUT_DIR):
-                    src = os.path.join(RAMPLOT_OUTPUT_DIR, name)
-                    if os.path.isfile(src):
-                        _safe_copy(src, step2_dir / name)
+                for item in Path(RAMPLOT_OUTPUT_DIR).rglob("*"):
+                    if item.is_file():
+                        rel = item.relative_to(RAMPLOT_OUTPUT_DIR)
+                        target = step2_dir / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        _safe_copy(item, target)
             result["steps"]["ramachandran"] = {"status": "success", "message": str(ram_status)}
         except Exception as exc:
             result["steps"]["ramachandran"] = {"status": "failed", "error": str(exc)}
@@ -199,9 +238,7 @@ class ProteinPipelineBatch:
         # 3) Protein preparation
         step3_dir = protein_dir / "03_protein_preparation"
         prep_final = _consume_generator(prepare_protein_meeko())
-        prep_download = None
-        if isinstance(prep_final, tuple) and len(prep_final) >= 3:
-            prep_download = _extract_update_value(prep_final[2])
+        prep_download = _extract_update_value(prep_final[2]) if isinstance(prep_final, tuple) and len(prep_final) >= 3 else None
 
         prepared_pdbqt = current_pdb_info.get("prepared_pdbqt")
         if not prepared_pdbqt or not os.path.exists(prepared_pdbqt):
@@ -215,17 +252,20 @@ class ProteinPipelineBatch:
         _safe_copy(prepared_pdbqt, step3_dir / Path(prepared_pdbqt).name)
         if prep_download and os.path.exists(prep_download):
             _safe_copy(prep_download, step3_dir / Path(prep_download).name)
+        try:
+            with open(prepared_pdbqt, "r", encoding="utf-8", errors="ignore") as f:
+                prep_iframe = show_structure(protein_text=f.read(), ligand_text=None, pdb_id=f"Prepared {pdb_id}", protein_name=protein_name)
+            save_3d_viewer_screenshot(prep_iframe, step3_dir / f"{pdb_id}_prepared.png")
+        except Exception:
+            pass
         result["steps"]["protein_preparation"] = {"status": "success", "prepared_pdbqt": prepared_pdbqt}
 
         # 4) Binding site prediction
         step4_dir = protein_dir / "04_binding_sites"
         try:
             pocket_final = _consume_generator(run_prankweb_prediction())
-            pocket_df = None
-            if isinstance(pocket_final, tuple) and len(pocket_final) >= 2:
-                pocket_df = _extract_update_value(pocket_final[1])
+            pocket_df = _extract_update_value(pocket_final[1]) if isinstance(pocket_final, tuple) and len(pocket_final) >= 2 else None
             combined_csv = self._save_df(pocket_df, step4_dir / "combined_pockets.csv")
-
             if os.path.exists(PRANKWEB_OUTPUT_DIR):
                 for item in Path(PRANKWEB_OUTPUT_DIR).rglob("*"):
                     if item.is_file():
@@ -233,11 +273,7 @@ class ProteinPipelineBatch:
                         target = step4_dir / rel
                         target.parent.mkdir(parents=True, exist_ok=True)
                         _safe_copy(item, target)
-
-            result["steps"]["binding_sites"] = {
-                "status": "success" if combined_csv or current_pdb_info.get("combined_csv") else "failed",
-                "combined_csv": current_pdb_info.get("combined_csv") or combined_csv,
-            }
+            result["steps"]["binding_sites"] = {"status": "success" if combined_csv or current_pdb_info.get("combined_csv") else "failed", "combined_csv": current_pdb_info.get("combined_csv") or combined_csv}
         except Exception as exc:
             result["steps"]["binding_sites"] = {"status": "failed", "error": str(exc)}
 
@@ -249,6 +285,11 @@ class ProteinPipelineBatch:
             lig_saved = self._save_df(lig_df, step5_dir / "ligand_classification_report.csv")
             if lig_csv and os.path.exists(lig_csv):
                 _safe_copy(lig_csv, step5_dir / Path(lig_csv).name)
+            if os.path.exists("ligand_pdb"):
+                ligand_pdb_dir = step5_dir / "ligand_pdb"
+                ligand_pdb_dir.mkdir(exist_ok=True)
+                for pdb_file in Path("ligand_pdb").glob("*.pdb"):
+                    _safe_copy(pdb_file, ligand_pdb_dir / pdb_file.name)
             result["steps"]["ligand_analysis"] = {"status": "success" if lig_saved else "failed", "csv": lig_saved}
         except Exception as exc:
             result["steps"]["ligand_analysis"] = {"status": "failed", "error": str(exc)}
@@ -257,16 +298,45 @@ class ProteinPipelineBatch:
         step6_dir = protein_dir / "06_docking"
         try:
             docking_final = _consume_generator(run_molecular_docking())
-            docking_df = None
-            if isinstance(docking_final, tuple) and len(docking_final) >= 2:
-                docking_df = _extract_update_value(docking_final[1])
+            docking_df = _extract_update_value(docking_final[1]) if isinstance(docking_final, tuple) and len(docking_final) >= 2 else None
             docking_csv = self._save_df(docking_df, step6_dir / "docking_summary.csv")
-
             if os.path.exists(DOCKING_RESULTS_DIR):
                 dst_tree = step6_dir / "docking_results"
                 if dst_tree.exists():
                     shutil.rmtree(dst_tree)
                 shutil.copytree(DOCKING_RESULTS_DIR, dst_tree)
+
+            # Screenshot top docked pose
+            if isinstance(docking_df, pd.DataFrame) and not docking_df.empty:
+                try:
+                    top = docking_df.sort_values(by="binding_energy", ascending=True).iloc[0]
+                    receptor_path = str(top.get("receptor_pdb_file") or current_pdb_info.get("pdb_path"))
+                    ligand_path = str(top.get("pdb_file"))
+                    pose_num = int(top.get("pose_number", 1))
+
+                    protein_text = Path(receptor_path).read_text(encoding="utf-8", errors="ignore") if os.path.exists(receptor_path) else ""
+                    ligand_text = ""
+                    if os.path.exists(ligand_path):
+                        lines = Path(ligand_path).read_text(encoding="utf-8", errors="ignore").splitlines(True)
+                        in_model = False
+                        model_lines: List[str] = []
+                        for line in lines:
+                            if line.startswith("MODEL"):
+                                try:
+                                    in_model = int(line.split()[1]) == pose_num
+                                except Exception:
+                                    in_model = False
+                            if in_model:
+                                model_lines.append(line)
+                            if in_model and line.startswith("ENDMDL"):
+                                break
+                        ligand_text = "".join(model_lines) if model_lines else "".join(lines)
+
+                    if protein_text and ligand_text:
+                        dock_iframe = show_structure(protein_text=protein_text, ligand_text=ligand_text, pdb_id="Docking", protein_name=str(top.get("ligand", "Ligand")))
+                        save_3d_viewer_screenshot(dock_iframe, step6_dir / "top_pose_3d.png")
+                except Exception:
+                    pass
 
             result["steps"]["docking"] = {"status": "success" if docking_csv else "failed", "csv": docking_csv}
         except Exception as exc:
@@ -313,7 +383,6 @@ class ProteinPipelineBatch:
                 _update_dft_script_file(str(pdb_path))
                 cmd = 'cmd /c "call activate orca_env && python dft.py"'
                 subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
                 if os.path.exists(single_csv):
                     df = pd.read_csv(single_csv)
                     if not df.empty:
@@ -330,11 +399,7 @@ class ProteinPipelineBatch:
         return {"status": "failed", "message": "No DFT rows collected"}
 
     def run_batch(self, proteins: List[str]) -> Dict[str, Any]:
-        batch_result: Dict[str, Any] = {
-            "start_time": datetime.now().isoformat(),
-            "proteins": {},
-        }
-
+        batch_result: Dict[str, Any] = {"start_time": datetime.now().isoformat(), "proteins": {}}
         for index, protein in enumerate(proteins, start=1):
             print(f"[{index}/{len(proteins)}] Processing: {protein}")
             try:
@@ -342,10 +407,7 @@ class ProteinPipelineBatch:
             except Exception as exc:
                 batch_result["proteins"][protein] = {"pipeline_status": "fatal_error", "error": str(exc)}
 
-        summary_rows = []
-        for p, data in batch_result["proteins"].items():
-            summary_rows.append({"protein": p, "status": data.get("pipeline_status", "unknown")})
-
+        summary_rows = [{"protein": p, "status": d.get("pipeline_status", "unknown")} for p, d in batch_result["proteins"].items()]
         summary_csv = self.output_base_dir / f"batch_summary_{self.timestamp}.csv"
         pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
         batch_result["summary_csv"] = str(summary_csv)
@@ -354,10 +416,16 @@ class ProteinPipelineBatch:
         with open(index_json, "w", encoding="utf-8") as f:
             json.dump(batch_result, f, indent=2)
         batch_result["batch_index"] = str(index_json)
-
         batch_result["end_time"] = datetime.now().isoformat()
         return batch_result
 
+def _load_proteins_from_cli(proteins: List[str], protein_file: Optional[str]) -> List[str]:
+    if proteins:
+        return proteins
+    if protein_file:
+        with open(protein_file, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    raise ValueError("Provide proteins using --proteins or --protein-file")
 
 def _load_proteins_from_cli(proteins: List[str], protein_file: Optional[str]) -> List[str]:
     if proteins:

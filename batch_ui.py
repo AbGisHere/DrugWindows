@@ -1,39 +1,74 @@
-"""Gradio UI for batch pipeline execution and result browsing."""
+"""Batch UI with app.py-style tabbed result browsing."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import gradio as gr
 import pandas as pd
 
 from batch import PIPELINE_STEPS, ProteinPipelineBatch, parse_protein_lines
 
-
-STEP_LABEL_TO_KEY = {label: key for key, label in PIPELINE_STEPS}
-
-
-def _status_badge(status: str) -> str:
-    status = (status or "unknown").lower()
-    if status == "success" or status == "completed":
-        return "<span style='background:#d4edda;color:#155724;padding:4px 10px;border-radius:12px;font-weight:700;'>SUCCESS</span>"
-    if status == "failed" or "error" in status:
-        return "<span style='background:#f8d7da;color:#721c24;padding:4px 10px;border-radius:12px;font-weight:700;'>FAILED</span>"
-    if status == "skipped":
-        return "<span style='background:#fff3cd;color:#856404;padding:4px 10px;border-radius:12px;font-weight:700;'>SKIPPED</span>"
-    return "<span style='background:#e2e3e5;color:#383d41;padding:4px 10px;border-radius:12px;font-weight:700;'>UNKNOWN</span>"
+STEP_KEYS = [k for k, _ in PIPELINE_STEPS]
+STEP_LABELS = [v for _, v in PIPELINE_STEPS]
+STEP_MAP = dict(PIPELINE_STEPS)
 
 
-def run_batch_from_ui(protein_lines: str, output_dir: str, run_dft: bool):
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())
+
+
+def _build_step_choices(output_dir: str, protein_name: str, step_key: str) -> List[str]:
+    if not protein_name:
+        return []
+    step_dir = Path(output_dir) / _safe_name(protein_name) / step_key
+    if not step_dir.exists():
+        return []
+    return [str(p) for p in sorted(step_dir.rglob("*")) if p.is_file()]
+
+
+def _render_file(path_str: str):
+    if not path_str:
+        return "", pd.DataFrame(), None, None
+
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        return f"⚠️ File not found: {path_str}", pd.DataFrame(), None, None
+
+    suf = p.suffix.lower()
+    text = ""
+    df = pd.DataFrame()
+    image = None
+    download = str(p)
+
+    if suf == ".csv":
+        try:
+            df = pd.read_csv(p).head(100)
+        except Exception as exc:
+            text = f"Failed to read CSV: {exc}"
+    elif suf in {".png", ".jpg", ".jpeg"}:
+        image = str(p)
+    elif suf in {".txt", ".log", ".md", ".json", ".pdb", ".pdbqt"}:
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")[:12000]
+        except Exception as exc:
+            text = f"Failed to read text: {exc}"
+    else:
+        text = f"Selected file: {p.name}"
+
+    return text, df, image, download
+
+
+def run_batch_ui(protein_lines: str, output_dir: str, run_dft: bool):
     proteins = parse_protein_lines(protein_lines)
     if not proteins:
         return (
-            gr.update(value="⚠️ Please enter at least one protein (one per line).", visible=True),
+            gr.update(value="⚠️ Enter at least one protein (one per line).", visible=True),
             gr.update(value=None, visible=False),
-            gr.update(choices=[], value=None, visible=True),
-            gr.update(value="", visible=False),
+            gr.update(choices=[], value=None),
+            *[gr.update(choices=[], value=None) for _ in STEP_KEYS],
         )
 
     runner = ProteinPipelineBatch(output_base_dir=output_dir.strip() or "batch_results", run_dft=run_dft)
@@ -41,50 +76,50 @@ def run_batch_from_ui(protein_lines: str, output_dir: str, run_dft: bool):
 
     rows = []
     for protein, data in result.get("proteins", {}).items():
-        rows.append({
-            "protein": protein,
-            "status": data.get("pipeline_status", "unknown"),
-            "start_time": data.get("start_time", ""),
-            "end_time": data.get("end_time", ""),
-        })
+        rows.append(
+            {
+                "Protein": protein,
+                "Status": data.get("pipeline_status", "unknown"),
+                "Started": data.get("start_time", ""),
+                "Ended": data.get("end_time", ""),
+            }
+        )
     df = pd.DataFrame(rows)
 
-    summary_html = f"""
-    <div style='padding:16px;border-radius:12px;background:linear-gradient(135deg,#667eea,#764ba2);color:white;'>
-        <h3 style='margin:0 0 8px 0;'>✅ Batch Run Complete</h3>
-        <p style='margin:0;'><b>Proteins processed:</b> {len(rows)}</p>
-        <p style='margin:0;'><b>Summary CSV:</b> {result.get('summary_csv')}</p>
-        <p style='margin:0;'><b>Index JSON:</b> {result.get('batch_index')}</p>
-    </div>
-    """
+    selected = proteins[0]
+    per_step_updates = []
+    for step_key in STEP_KEYS:
+        choices = _build_step_choices(output_dir, selected, step_key)
+        per_step_updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
 
-    choices = list(result.get("proteins", {}).keys())
     return (
-        gr.update(value="✅ Batch pipeline finished.", visible=True),
+        gr.update(value="✅ Batch finished", visible=True),
         gr.update(value=df, visible=True),
-        gr.update(choices=choices, value=choices[0] if choices else None, visible=True),
-        gr.update(value=summary_html, visible=True),
+        gr.update(choices=proteins, value=selected),
+        *per_step_updates,
     )
 
 
-def _step_dir_for(protein_name: str, output_dir: str, step_label: str) -> Path:
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in protein_name.strip())
-    step_key = STEP_LABEL_TO_KEY[step_label]
-    return Path(output_dir) / safe / step_key
+def on_protein_change(protein_name: str, output_dir: str):
+    updates = []
+    for step_key in STEP_KEYS:
+        choices = _build_step_choices(output_dir, protein_name, step_key)
+        updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
+    return updates
 
 
-def load_protein_overview(protein_name: str, output_dir: str):
+def load_protein_summary(protein_name: str, output_dir: str):
     if not protein_name:
-        return gr.update(value="", visible=False)
+        return ""
 
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in protein_name.strip())
-    summary_path = Path(output_dir) / safe / "pipeline_summary.json"
+    summary_path = Path(output_dir) / _safe_name(protein_name) / "pipeline_summary.json"
     if not summary_path.exists():
-        return gr.update(value=f"⚠️ Summary not found: {summary_path}", visible=True)
+        return f"⚠️ Summary file missing: {summary_path}"
 
     data = json.loads(summary_path.read_text(encoding="utf-8"))
-    rows = []
-    map_key = {
+    lines = [f"### 🧬 {protein_name}", f"**Pipeline status:** {data.get('pipeline_status', 'unknown')}"]
+
+    key_map = {
         "01_structure_search": "structure_search",
         "02_ramachandran": "ramachandran",
         "03_protein_preparation": "protein_preparation",
@@ -94,120 +129,84 @@ def load_protein_overview(protein_name: str, output_dir: str):
         "07_admet": "admet",
         "08_dft": "dft",
     }
-    for step_key, step_label in PIPELINE_STEPS:
-        step_data = data.get("steps", {}).get(map_key[step_key], {})
-        rows.append(f"<tr><td>{step_label}</td><td>{_status_badge(step_data.get('status', 'N/A'))}</td></tr>")
+    for step_key, label in PIPELINE_STEPS:
+        step_data = data.get("steps", {}).get(key_map[step_key], {})
+        lines.append(f"- **{label}**: {step_data.get('status', 'n/a')}")
 
-    html = f"""
-    <div style='background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;'>
-      <h3 style='margin-top:0;'>🧬 Protein: {protein_name}</h3>
-      <p><b>Pipeline status:</b> {data.get('pipeline_status', 'unknown')}</p>
-      <table style='width:100%;border-collapse:collapse;'>
-        <thead><tr><th style='text-align:left;'>Step</th><th style='text-align:left;'>Status</th></tr></thead>
-        <tbody>{''.join(rows)}</tbody>
-      </table>
-    </div>
-    """
-    return gr.update(value=html, visible=True)
+    return "\n".join(lines)
 
 
-def load_step_details(protein_name: str, step_label: str, output_dir: str):
-    if not protein_name or not step_label:
-        return None, [], "", None, []
-
-    step_dir = _step_dir_for(protein_name, output_dir, step_label)
-    if not step_dir.exists():
-        return pd.DataFrame(), [], f"⚠️ Step folder not found: {step_dir}", None, []
-
-    csv_files = sorted(step_dir.rglob("*.csv"))
-    image_files = sorted([p for p in step_dir.rglob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
-    text_files = sorted([p for p in step_dir.rglob("*") if p.suffix.lower() in {".txt", ".md", ".json", ".log"}])
-    all_files = [str(p) for p in sorted(step_dir.rglob("*")) if p.is_file()]
-
-    preview_df = pd.DataFrame()
-    if csv_files:
-        try:
-            preview_df = pd.read_csv(csv_files[0]).head(50)
-        except Exception:
-            preview_df = pd.DataFrame()
-
-    text_preview = ""
-    if text_files:
-        try:
-            text_preview = text_files[0].read_text(encoding="utf-8", errors="ignore")[:5000]
-        except Exception as exc:
-            text_preview = f"Failed to read text preview: {exc}"
-
-    file_table = pd.DataFrame({"files": all_files}) if all_files else pd.DataFrame({"files": []})
-    image_gallery = [(str(path), path.name) for path in image_files]
-
-    first_csv = str(csv_files[0]) if csv_files else None
-    return file_table, image_gallery, text_preview, first_csv, preview_df
-
-
-with gr.Blocks(theme=gr.themes.Soft(), title="Batch Protein Pipeline") as demo:
-    gr.HTML("<div class='main-header'><h1>🧪 Batch Protein Structure Finder & Analyzer</h1></div>")
+with gr.Blocks(theme=gr.themes.Soft(), title="Batch Protein Structure Finder & Analyzer") as demo:
+    gr.HTML("<div class='main-header'><h1>🧬 Batch Protein Structure Finder & Analyzer</h1></div>")
 
     with gr.Tabs() as tabs:
-        with gr.Tab("1️⃣ Batch Input", id=0):
-            gr.Markdown("### Enter one protein per line and run the full pipeline batch")
+        with gr.Tab("🔍 Batch Input", id=0):
+            gr.Markdown("### Enter proteins for batch execution")
             with gr.Row():
                 with gr.Column(scale=1):
-                    protein_lines = gr.Textbox(
-                        label="Protein List",
-                        lines=12,
-                        placeholder="KRAS\nPI3K\nmTOR\nEGFR",
-                    )
-                    output_dir = gr.Textbox(label="Output Directory", value="batch_results")
+                    protein_lines = gr.Textbox(label="Protein List (one per line)", lines=12, placeholder="KRAS\nPI3K\nmTOR")
+                    output_dir = gr.Textbox(label="Output Root Folder", value="batch_results")
                     run_dft = gr.Checkbox(label="Run DFT step", value=False)
-                    run_btn = gr.Button("🚀 Run Batch Pipeline", variant="primary")
+                    run_btn = gr.Button("🚀 Run Batch", variant="primary")
                     run_status = gr.Markdown(visible=False)
                 with gr.Column(scale=2):
-                    batch_summary_html = gr.HTML(visible=False)
-                    batch_summary_df = gr.Dataframe(label="Batch Summary", visible=False)
-            next_btn = gr.Button("Next: View Results →", variant="secondary")
+                    batch_df = gr.Dataframe(label="Batch Summary", visible=False)
+            next_btn_0 = gr.Button("Next: Results Browser →", variant="primary")
 
-        with gr.Tab("2️⃣ Batch Results Browser", id=1):
-            gr.Markdown("### Select a protein and inspect results for each pipeline step")
-            protein_selector = gr.Dropdown(label="Choose Protein", choices=[], interactive=True)
-            protein_overview = gr.HTML(visible=False)
+        with gr.Tab("📊 Overview", id=1):
+            gr.Markdown("### Batch Result Overview")
+            protein_selector = gr.Dropdown(label="Select Protein", choices=[], interactive=True)
+            protein_summary = gr.Markdown()
+            next_btn_1 = gr.Button("Next: Structure Search →", variant="primary")
 
-            with gr.Row():
-                step_selector = gr.Dropdown(
-                    label="Choose Step",
-                    choices=[label for _, label in PIPELINE_STEPS],
-                    value="Structure Search",
-                    interactive=True,
-                )
-                refresh_btn = gr.Button("Refresh Step View", variant="secondary")
+        tab_components: Dict[str, Tuple] = {}
+        tab_defs = [
+            (2, "🧬 Structure Search", "01_structure_search"),
+            (3, "📈 Ramachandran", "02_ramachandran"),
+            (4, "🛠 Protein Preparation", "03_protein_preparation"),
+            (5, "🎯 Binding Sites", "04_binding_sites"),
+            (6, "🧪 Ligand Analysis", "05_ligand_analysis"),
+            (7, "🚀 Docking", "06_docking"),
+            (8, "💊 ADMET", "07_admet"),
+            (9, "⚛️ DFT", "08_dft"),
+        ]
 
-            with gr.Row():
-                with gr.Column(scale=1):
-                    files_df = gr.Dataframe(label="Files in Step Folder")
-                    csv_download = gr.File(label="Primary CSV Download")
-                with gr.Column(scale=2):
-                    csv_preview = gr.Dataframe(label="CSV Preview (first 50 rows)")
-                    text_preview = gr.Markdown(label="Text Preview")
-            step_gallery = gr.Gallery(label="Step Images", columns=3, rows=2, height=360)
+        for tab_id, tab_title, step_key in tab_defs:
+            with gr.Tab(tab_title, id=tab_id):
+                gr.Markdown(f"### {STEP_MAP[step_key]} Results")
+                selector = gr.Dropdown(label=f"Select file from {STEP_MAP[step_key]}", choices=[], interactive=True)
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        file_download = gr.File(label="Download selected file")
+                        text_preview = gr.Markdown(label="Text Preview")
+                    with gr.Column(scale=2):
+                        csv_preview = gr.Dataframe(label="CSV Preview")
+                        img_preview = gr.Image(label="Image Preview", type="filepath")
+                tab_components[step_key] = (selector, text_preview, csv_preview, img_preview, file_download)
 
-    next_btn.click(lambda: gr.Tabs(selected=1), inputs=None, outputs=tabs)
+                selector.change(fn=_render_file, inputs=[selector], outputs=[text_preview, csv_preview, img_preview, file_download])
 
+    # navigation
+    next_btn_0.click(lambda: gr.Tabs(selected=1), None, tabs)
+    next_btn_1.click(lambda: gr.Tabs(selected=2), None, tabs)
+
+    # run batch
     run_btn.click(
-        fn=run_batch_from_ui,
+        fn=run_batch_ui,
         inputs=[protein_lines, output_dir, run_dft],
-        outputs=[run_status, batch_summary_df, protein_selector, batch_summary_html],
+        outputs=[run_status, batch_df, protein_selector] + [tab_components[k][0] for k in STEP_KEYS],
     )
 
+    # protein switch updates all step dropdowns + summary
     protein_selector.change(
-        fn=load_protein_overview,
+        fn=load_protein_summary,
         inputs=[protein_selector, output_dir],
-        outputs=[protein_overview],
+        outputs=[protein_summary],
     )
-
-    refresh_btn.click(
-        fn=load_step_details,
-        inputs=[protein_selector, step_selector, output_dir],
-        outputs=[files_df, step_gallery, text_preview, csv_download, csv_preview],
+    protein_selector.change(
+        fn=on_protein_change,
+        inputs=[protein_selector, output_dir],
+        outputs=[tab_components[k][0] for k in STEP_KEYS],
     )
 
 

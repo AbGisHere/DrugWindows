@@ -419,6 +419,13 @@ class ProteinPipelineBatch:
         batch_result["end_time"] = datetime.now().isoformat()
         return batch_result
 
+def _load_proteins_from_cli(proteins: List[str], protein_file: Optional[str]) -> List[str]:
+    if proteins:
+        return proteins
+    if protein_file:
+        with open(protein_file, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    raise ValueError("Provide proteins using --proteins or --protein-file")
 
 def _load_proteins_from_cli(proteins: List[str], protein_file: Optional[str]) -> List[str]:
     if proteins:

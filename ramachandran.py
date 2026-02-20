@@ -5,6 +5,8 @@ Ramachandran plot analysis module with SWISS-MODEL integration
 import os
 import subprocess
 import glob
+import shutil
+import tempfile
 import gradio as gr
 import requests
 import time
@@ -181,27 +183,7 @@ def run_swiss_model(fasta_path: str, pdb_id: str, progress_callback=None) -> str
         except Exception:
             time.sleep(poll_interval)
 
-def run_ramplot(progress=gr.Progress()):
-    """
-    Run Ramachandran plot analysis.
-    """
-    # 1. No structure case
-    if not current_pdb_info["pdb_id"] or not current_pdb_info["pdb_path"]:
-        return (
-            gr.update(value="<div style='padding: 20px; background: #fee; border-radius: 8px; color: #c33;'>❌ No structure loaded. Please search for a protein first.</div>", visible=True),
-            gr.update(visible=False), gr.update(visible=False),
-            gr.update(visible=False), gr.update(visible=False),
-            gr.update(visible=False)
-        )
 
-    # IMMEDIATELY show a loading indicator (This is handled by the .click event below, 
-    # but we ensure the status box is visible here)
-    
-    pdb_id = current_pdb_info["pdb_id"]
-    pdb_path = current_pdb_info["pdb_path"]
-    
-    # ... (rest of your existing logic: Swiss-Model, subprocess.run, etc.) ...
-    
 def run_ramplot(progress=gr.Progress()):
     """
     Run Ramachandran plot analysis.
@@ -232,7 +214,6 @@ def run_ramplot(progress=gr.Progress()):
         if not os.path.exists(fasta_path):
             print("Warning: FASTA file not found. Skipping SWISS-MODEL and using original PDB.")
             progress(0.15, desc="⚠️ FASTA missing - Using original structure...")
-            # We proceed with original pdb_path
         else:
             # Try running SWISS-MODEL
             swiss_model_path = run_swiss_model(fasta_path, pdb_id, progress)
@@ -241,7 +222,6 @@ def run_ramplot(progress=gr.Progress()):
             if not swiss_model_path:
                 print("Warning: SWISS-MODEL failed. Skipping and using original PDB.")
                 progress(0.2, desc="⚠️ SWISS-MODEL failed - Reverting to original PDB...")
-                # We proceed with original pdb_path
             else:
                 # SUCCESS: Switch to new model
                 pdb_path = swiss_model_path
@@ -255,25 +235,29 @@ def run_ramplot(progress=gr.Progress()):
     progress(0.3, desc="🔬 Running Ramachandran plot analysis...")
 
     try:
-        input_folder = PROTEINS_DIR
         output_folder = RAMPLOT_OUTPUT_DIR
-        os.makedirs(input_folder, exist_ok=True)
         os.makedirs(output_folder, exist_ok=True)
 
         progress(0.5, desc="Executing ramplot command...")
 
-        # We must ensure we run ramplot on the SPECIFIC file we decided on (original or model)
-        # ramplot typically takes a folder input ("-i input_folder"). 
-        # To ensure it processes the correct file if we switched to a model, 
-        # we might need to be careful if both files exist in the folder.
-        # However, usually ramplot processes all PDBs in the folder.
-        
-        cmd = [
-            "ramplot", "pdb", "-i", input_folder, "-o", output_folder,
-            "-m", "0", "-r", "600", "-p", "png"
-        ]
+        # --- BUG FIX: Create an isolated folder for ramplot input ---
+        temp_input_dir = os.path.join(output_folder, "temp_isolated_input")
+        os.makedirs(temp_input_dir, exist_ok=True)
 
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        try:
+            # Copy ONLY the chosen PDB (original or swiss-model) to this temp folder
+            shutil.copy2(pdb_path, temp_input_dir)
+            
+            cmd = [
+                "ramplot", "pdb", "-i", temp_input_dir, "-o", output_folder,
+                "-m", "0", "-r", "600", "-p", "png"
+            ]
+
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        finally:
+            # Ensure the temporary folder is deleted afterward so it doesn't leave junk files
+            if os.path.exists(temp_input_dir):
+                shutil.rmtree(temp_input_dir)
 
         progress(0.8, desc="Loading generated plots...")
 
@@ -285,7 +269,7 @@ def run_ramplot(progress=gr.Progress()):
             'std3d': os.path.join(plot_dir, "StdMapType3DGeneral.png"),
         }
 
-        # 4. Extract Statistics
+        # 4. Extract Statistics 
         csv_files = glob.glob(os.path.join(output_folder, "*.csv"))
         stats_html = ""
         

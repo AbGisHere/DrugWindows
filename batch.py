@@ -464,39 +464,43 @@ class ProteinPipelineBatch:
                 saved_screenshots: List[str] = []
                 if isinstance(docking_df, pd.DataFrame) and not docking_df.empty:
                     try:
-                        # Create a specific directory for all the 3D pose screenshots
-                        screenshots_dir = step6_dir / "3d_pose_screenshots"
-                        screenshots_dir.mkdir(exist_ok=True)
+                        # Save 3D screenshots directly into docking_reports alongside 2D files
+                        reports_dir = step6_dir / "docking_results" / "docking_reports"
+                        reports_dir.mkdir(parents=True, exist_ok=True)
                         
                         print(f"  -> Generating 3D screenshots for ALL {len(docking_df)} docked poses (this may take a few minutes)...")
                         
                         for idx, row in docking_df.iterrows():
-                            chain_val = row.get("chain", "unknown")
-                            pose_num = row.get("pose_number", idx)
-                            ligand_name = row.get("ligand", f"ligand_{idx}")
+                            ligand_path_str = str(row.get("pdb_file", ""))
+                            if not ligand_path_str:
+                                continue
+                                
+                            ligand_path = Path(ligand_path_str)
+                            pose_num = int(row.get("pose_number", 1))
                             
-                            safe_chain = "".join(c if str(c).isalnum() or c in "-_" else "_" for c in str(chain_val))
-                            safe_ligand = "".join(c if str(c).isalnum() or c in "-_" else "_" for c in str(ligand_name))
+                            # Extract base name to PERFECTLY MATCH the 2D interaction reports
+                            # e.g., 'Chain_A_SKNKS 1_fpocket_pocket1_out.pdbqt' -> 'Chain_A_SKNKS 1_fpocket_pocket1'
+                            base_name = ligand_path.stem
+                            if base_name.endswith('_out'): base_name = base_name[:-4]
+                            elif base_name.endswith('_docked'): base_name = base_name[:-7]
                             
-                            # UPDATED: File naming now includes the ligand name to prevent overwriting
-                            screenshot_name = f"{safe_ligand}_chain_{safe_chain}_pose_{pose_num}_3d.png"
+                            # Final file name prevents overwriting by including pose number
+                            screenshot_name = f"{base_name}_pose_{pose_num}_3d.png"
                             
                             receptor_path = str(row.get("receptor_pdb_file") or current_pdb_info.get("pdb_path"))
-                            ligand_path = Path(str(row.get("pdb_file", "")))
-                            p_num = int(pose_num)
-
+                            
                             protein_text = Path(receptor_path).read_text(encoding="utf-8", errors="ignore") if receptor_path and os.path.exists(receptor_path) else ""
-                            ligand_text = _extract_pose_text_from_pdbqt(ligand_path, p_num)
+                            ligand_text = _extract_pose_text_from_pdbqt(ligand_path, pose_num)
 
                             if protein_text and ligand_text:
                                 dock_iframe = show_structure(
                                     protein_text=protein_text,
                                     ligand_text=ligand_text,
-                                    pdb_id=f"Pose {p_num}",
-                                    protein_name=str(ligand_name),
+                                    pdb_id=f"Pose {pose_num}",
+                                    protein_name=base_name,
                                 )
                                 
-                                target_file = screenshots_dir / screenshot_name
+                                target_file = reports_dir / screenshot_name
                                 if save_3d_viewer_screenshot(dock_iframe, target_file):
                                     saved_screenshots.append(str(target_file))
                                     print(f"     📸 Saved: {screenshot_name}")

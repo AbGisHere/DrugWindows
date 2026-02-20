@@ -184,7 +184,7 @@ def run_swiss_model(fasta_path: str, pdb_id: str, progress_callback=None) -> str
             time.sleep(poll_interval)
 
 
-def run_ramplot(progress=gr.Progress()):
+def run_ramplot(progress=None): # Note: Removed default gr.Progress() to allow headless mode
     """
     Run Ramachandran plot analysis.
     Returns: (status_html, plot1, plot2, plot3, plot4, stats_html)
@@ -203,17 +203,20 @@ def run_ramplot(progress=gr.Progress()):
     swiss_model_used = False
     
     # 2. Check for REMARK 465
-    progress(0.05, desc="🔍 Checking for missing residues (REMARK 465)...")
+    if progress:
+        progress(0.05, desc="🔍 Checking for missing residues (REMARK 465)...")
     has_missing_residues = check_remark_465(pdb_path)
     
     if has_missing_residues:
-        progress(0.1, desc="⚠️ Missing residues detected - Attempting SWISS-MODEL...")
+        if progress:
+            progress(0.1, desc="⚠️ Missing residues detected - Attempting SWISS-MODEL...")
         fasta_path = os.path.join(PROTEINS_DIR, f"{pdb_id}.fasta")
         
         # --- FALLBACK CHECK 1: FASTA Existence ---
         if not os.path.exists(fasta_path):
             print("Warning: FASTA file not found. Skipping SWISS-MODEL and using original PDB.")
-            progress(0.15, desc="⚠️ FASTA missing - Using original structure...")
+            if progress:
+                progress(0.15, desc="⚠️ FASTA missing - Using original structure...")
         else:
             # Try running SWISS-MODEL
             swiss_model_path = run_swiss_model(fasta_path, pdb_id, progress)
@@ -221,24 +224,29 @@ def run_ramplot(progress=gr.Progress()):
             # --- FALLBACK CHECK 2: API Success ---
             if not swiss_model_path:
                 print("Warning: SWISS-MODEL failed. Skipping and using original PDB.")
-                progress(0.2, desc="⚠️ SWISS-MODEL failed - Reverting to original PDB...")
+                if progress:
+                    progress(0.2, desc="⚠️ SWISS-MODEL failed - Reverting to original PDB...")
             else:
                 # SUCCESS: Switch to new model
                 pdb_path = swiss_model_path
                 current_pdb_info["pdb_path"] = swiss_model_path
                 swiss_model_used = True
-                progress(0.9, desc="✅ SWISS-MODEL complete...")
+                if progress:
+                    progress(0.9, desc="✅ SWISS-MODEL complete...")
     else:
-        progress(0.1, desc="✅ No missing residues - using original...")
+        if progress:
+            progress(0.1, desc="✅ No missing residues - using original...")
 
     # 3. Run Ramachandran analysis
-    progress(0.3, desc="🔬 Running Ramachandran plot analysis...")
+    if progress:
+        progress(0.3, desc="🔬 Running Ramachandran plot analysis...")
 
     try:
         output_folder = RAMPLOT_OUTPUT_DIR
         os.makedirs(output_folder, exist_ok=True)
 
-        progress(0.5, desc="Executing ramplot command...")
+        if progress:
+            progress(0.5, desc="Executing ramplot command...")
 
         # --- BUG FIX: Create an isolated folder for ramplot input ---
         temp_input_dir = os.path.join(output_folder, "temp_isolated_input")
@@ -259,7 +267,8 @@ def run_ramplot(progress=gr.Progress()):
             if os.path.exists(temp_input_dir):
                 shutil.rmtree(temp_input_dir)
 
-        progress(0.8, desc="Loading generated plots...")
+        if progress:
+            progress(0.8, desc="Loading generated plots...")
 
         plot_dir = os.path.join(output_folder, "Plots")
         plot_files = {
@@ -269,7 +278,7 @@ def run_ramplot(progress=gr.Progress()):
             'std3d': os.path.join(plot_dir, "StdMapType3DGeneral.png"),
         }
 
-        # 4. Extract Statistics 
+        # 4. Extract Statistics
         csv_files = glob.glob(os.path.join(output_folder, "*.csv"))
         stats_html = ""
         
@@ -306,7 +315,8 @@ def run_ramplot(progress=gr.Progress()):
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing plot: {path}")
 
-        progress(1.0, desc="✅ Complete!")
+        if progress:
+            progress(1.0, desc="✅ Complete!")
 
         success_msg = "✅ Ramachandran plot analysis completed!"
         if swiss_model_used:

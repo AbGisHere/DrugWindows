@@ -551,62 +551,131 @@ class ProteinPipelineBatch:
         return result
 
     def _run_dft_batch(self, step_dir: Path) -> Dict[str, Any]:
-        # 🛑 FIX: Changed the glob pattern to target only *_complex.pdb files
-        all_pdbs = list(Path(DOCKING_RESULTS_DIR).glob("**/docked_pdb/*_complex.pdb")) if os.path.exists(DOCKING_RESULTS_DIR) else []
-        if not all_pdbs:
-            print(f"⚠️ [Step 8] No docked complex PDB files found for DFT.")
-            return {"status": "skipped", "message": "No docked complex PDB files found"}
+        print(f"  -> Locating best docked pose for DFT analysis...")
+        
+        # 1. Find the docking summary to identify the best pose
+        docking_dir = step_dir.parent / "06_docking"
+        docking_csv = next(docking_dir.rglob("*summary*.csv"), None)
+        
+        if not docking_csv or not docking_csv.exists():
+            print(f"    ⚠️ [Step 8] No docking summary found in {docking_dir.name}. Cannot determine best pose.")
+            return {"status": "skipped", "message": "No docking summary found"}
 
-        single_csv = "orca_electronic_metrics.csv"
+        try:
+            df = pd.read_csv(docking_csv)
+            # Find the energy/affinity column
+            energy_col = next((col for col in df.columns if 'affinity' in col.lower() or 'energy' in col.lower()), None)
+            
+            if not energy_col or df.empty:
+                print("    ⚠️ Could not determine binding energy column or dataframe is empty. Skipping DFT.")
+                return {"status": "skipped", "message": "Missing energy column in docking summary"}
+
+            # Find the row with the lowest energy (most negative affinity)
+            best_row = df.loc[df[energy_col].idxmin()]
+            
+            # Find the complex PDB file path
+            best_complex_path_str = best_row.get("Complex_PDB")
+            if not best_complex_path_str or pd.isna(best_complex_path_str):
+                # Fallback 1: try to find a column with 'complex' in the name
+                complex_col = next((col for col in df.columns if 'complex' in col.lower() and 'pdb' in col.lower()), None)
+                if complex_col:
+                    best_complex_path_str = best_row.get(complex_col)
+                    
+            # --- NEW LOGIC: Fallback 2: Use pdb_file and replace _ligand with _complex ---
+            if not best_complex_path_str or pd.isna(best_complex_path_str):
+                pdb_col = next((col for col in df.columns if 'pdb' in col.lower() and 'file' in col.lower()), None)
+                if pdb_col:
+                    pdb_file_str = best_row.get(pdb_col)
+                    if pdb_file_str and not pd.isna(pdb_file_str):
+                        best_complex_path_str = str(pdb_file_str).replace("_ligand", "_complex")
+            # --------------------------------------------------------------------------------
+
+            if not best_complex_path_str or pd.isna(best_complex_path_str):
+                 print("    ⚠️ Could not find Complex_PDB path in the summary CSV.")
+                 return {"status": "skipped", "message": "Missing Complex_PDB in summary"}
+
+            # --- NEW LOGIC: Robust Path Resolution ---
+            best_complex_path = Path(best_complex_path_str)
+            if not best_complex_path.exists():
+                # Search recursively inside the docking directory to find the file
+                found_files = list(docking_dir.rglob(best_complex_path.name))
+                if found_files:
+                    best_complex_path = found_files[0]
+                else:
+                    best_complex_path = Path(best_complex_path_str).resolve()
+            # -----------------------------------------
+            
+            if not best_complex_path.exists():
+                print(f"    ⚠️ Best complex PDB file not found on disk: {best_complex_path}")
+                return {"status": "skipped", "message": "Best complex PDB file not found"}
+
+            print(f"    🌟 Best pose selected: {best_complex_path.name} | Energy: {best_row[energy_col]}")
+
+        except Exception as e:
+            print(f"    ❌ Error parsing docking summary: {e}")
+            return {"status": "failed", "message": f"Error reading docking summary: {e}"}
+
+        # 2. Set up and run DFT on the single best pose
+        orca_temp = Path("orca_temp")
+        
+        # Clean up any leftover temp folder from a previous aborted run before starting
+        if orca_temp.exists():
+            shutil.rmtree(orca_temp, ignore_errors=True)
+            
         all_results: List[Dict[str, Any]] = []
         
-        def _clean_dft_temps():
-            """Deletes intermediate ORCA calculation files to keep runs isolated."""
-            if os.path.exists(single_csv):
-                os.remove(single_csv)
-            for ext in [".xyz", ".gbw", ".out", ".engrad", ".prop"]:
-                for f in Path(".").glob(f"*{ext}"):
-                    try: os.remove(f)
-                    except: pass
-
-        for i, pdb_path in enumerate(all_pdbs, start=1):
-            print(f"  -> Running ORCA for complex pose {i}/{len(all_pdbs)}: {pdb_path.name}")
-            _clean_dft_temps() # Clean up before run
+        try:
+            print(f"  -> Running ORCA on {best_complex_path.name}")
+            # Update dft.py with the single best file
+            _update_dft_script_file(str(best_complex_path))
             
-            try:
-                _update_dft_script_file(str(pdb_path))
-                cmd = 'cmd /c "call activate orca_env && python dft.py"'
-                subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                
-                # Copy all ORCA output files into an isolated folder
-                calc_folder = step_dir / pdb_path.stem
+            cmd = 'cmd /c "call activate orca_env && python dft.py"'
+            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            # 3. Handle outputs from the isolated temp folder
+            if orca_temp.exists():
+                calc_folder = step_dir / best_complex_path.stem
                 calc_folder.mkdir(exist_ok=True)
-                for ext in [".xyz", ".gbw", ".out", ".engrad", ".prop"]:
-                    for f in Path(".").glob(f"*{ext}"):
-                        try: shutil.copy2(f, calc_folder / f.name)
-                        except Exception: pass
-
-                # Extract and store the data from this single run
-                if os.path.exists(single_csv):
-                    df = pd.read_csv(single_csv)
-                    if not df.empty:
-                        row = df.iloc[-1].to_dict()
-                        row["Filename"] = pdb_path.name
-                        all_results.append(row)
-                        print(f"     ✅ Data extracted and outputs saved to {calc_folder.name}/")
-                else:
-                    print(f"     ❌ ORCA calculation failed for {pdb_path.name}")
-            except Exception as exc:
-                print(f"     ❌ ORCA execution error for {pdb_path.name}: {exc}")
-                all_results.append({"Filename": pdb_path.name, "error": str(exc)})
                 
-        _clean_dft_temps() # Clean up after final run
+                # Move everything to the safe result folder for this pose
+                for f in orca_temp.glob("*"):
+                    try: 
+                        shutil.copy2(f, calc_folder / f.name)
+                    except Exception as e: 
+                        print(f"    ⚠️ Failed to copy {f.name}: {e}")
+                
+                # Extract data from the temp CSV generated by dft.py
+                temp_csv = orca_temp / "dft_batch_results.csv"
+                if temp_csv.exists():
+                    dft_df = pd.read_csv(temp_csv)
+                    if not dft_df.empty:
+                        row = dft_df.iloc[-1].to_dict()
+                        row["Filename"] = best_complex_path.name
+                        row["Binding_Energy"] = best_row[energy_col] # Keep track of the binding affinity!
+                        all_results.append(row)
+                        print(f"    ✅ Data extracted and outputs saved to {calc_folder.name}/")
+                else:
+                    print(f"    ❌ ORCA calculation failed (no CSV output) for {best_complex_path.name}")
+                    all_results.append({"Filename": best_complex_path.name, "error": "No CSV generated"})
+                    
+                # Clean up the root temp folder
+                shutil.rmtree(orca_temp, ignore_errors=True)
+                print(f"    🧹 Cleaned up temporary ORCA files.")
+            else:
+                print(f"    ❌ ORCA temporary folder not found. Calculation failed.")
+                all_results.append({"Filename": best_complex_path.name, "error": "Temp folder not created"})
+                
+        except Exception as exc:
+            print(f"    ❌ ORCA execution error: {exc}")
+            all_results.append({"Filename": best_complex_path.name, "error": str(exc)})
 
+        # 4. Save the final single-row batch result for the UI to read
         if all_results:
             out_csv = step_dir / "dft_batch_results.csv"
             pd.DataFrame(all_results).to_csv(out_csv, index=False)
-            print(f"✅ [Step 8] DFT batch complete. Processed {len(all_results)} complex files.")
-            return {"status": "success", "count": len(all_results), "csv": str(out_csv)}
+            print(f"✅ [Step 8] DFT step complete for best pose.")
+            return {"status": "success", "count": 1, "csv": str(out_csv)}
+            
         return {"status": "failed", "message": "No DFT rows collected"}
 
     def run_batch(self, proteins: List[str]) -> Dict[str, Any]:

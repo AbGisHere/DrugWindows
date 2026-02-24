@@ -20,7 +20,7 @@ if not ORCA_EXE.exists():
     ORCA_EXE = ORCA_FOLDER / "orca_startup_mpi.exe"
 
 # 2. INPUT DATA (This line is overwritten by app.py automatically)
-PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Sotorasib_fpocket_pocket4_complex.pdb'
+PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Adagrasib_fpocket_pocket1_complex.pdb'
 LIGAND_NAME = "UNL"            
 
 # --- OPTIMIZATION: TIGHTER BUFFER ---
@@ -28,13 +28,15 @@ POCKET_RADIUS = 4.0
 
 # 3. CALCULATION SETTINGS
 # Changed from BASE_DIR / "orca_calc_folder" to BASE_DIR so batch_runner can find the files
-WORKING_DIR = BASE_DIR 
+WORKING_DIR = BASE_DIR / "orca_temp"
+WORKING_DIR.mkdir(exist_ok=True) # Ensure the temp folder exists
+
 INPUT_NAME  = "ligand.inp"
 OUTPUT_NAME = "ligand.out"
 
 # 4. OUTPUT CSV FILES
-METRICS_CSV = BASE_DIR / "orca_electronic_metrics.csv"
-CHARGES_CSV = BASE_DIR / "orca_mulliken_charges.csv"
+METRICS_CSV = WORKING_DIR / "dft_batch_results.csv"
+CHARGES_CSV = WORKING_DIR / "orca_mulliken_charges.csv"
 # ======================================================
 
 def get_pocket_atoms(pdb_path, lig_name, radius):

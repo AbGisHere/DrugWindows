@@ -551,10 +551,11 @@ class ProteinPipelineBatch:
         return result
 
     def _run_dft_batch(self, step_dir: Path) -> Dict[str, Any]:
-        all_pdbs = list(Path(DOCKING_RESULTS_DIR).glob("**/docked_pdb/*.pdb")) if os.path.exists(DOCKING_RESULTS_DIR) else []
+        # 🛑 FIX: Changed the glob pattern to target only *_complex.pdb files
+        all_pdbs = list(Path(DOCKING_RESULTS_DIR).glob("**/docked_pdb/*_complex.pdb")) if os.path.exists(DOCKING_RESULTS_DIR) else []
         if not all_pdbs:
-            print(f"⚠️ [Step 8] No docked PDB files found for DFT.")
-            return {"status": "skipped", "message": "No docked PDB files found"}
+            print(f"⚠️ [Step 8] No docked complex PDB files found for DFT.")
+            return {"status": "skipped", "message": "No docked complex PDB files found"}
 
         single_csv = "orca_electronic_metrics.csv"
         all_results: List[Dict[str, Any]] = []
@@ -569,7 +570,7 @@ class ProteinPipelineBatch:
                     except: pass
 
         for i, pdb_path in enumerate(all_pdbs, start=1):
-            print(f"  -> Running ORCA for pose {i}/{len(all_pdbs)}: {pdb_path.name}")
+            print(f"  -> Running ORCA for complex pose {i}/{len(all_pdbs)}: {pdb_path.name}")
             _clean_dft_temps() # Clean up before run
             
             try:
@@ -604,7 +605,7 @@ class ProteinPipelineBatch:
         if all_results:
             out_csv = step_dir / "dft_batch_results.csv"
             pd.DataFrame(all_results).to_csv(out_csv, index=False)
-            print(f"✅ [Step 8] DFT batch complete. Processed {len(all_results)} files.")
+            print(f"✅ [Step 8] DFT batch complete. Processed {len(all_results)} complex files.")
             return {"status": "success", "count": len(all_results), "csv": str(out_csv)}
         return {"status": "failed", "message": "No DFT rows collected"}
 

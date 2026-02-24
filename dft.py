@@ -20,14 +20,15 @@ if not ORCA_EXE.exists():
     ORCA_EXE = ORCA_FOLDER / "orca_startup_mpi.exe"
 
 # 2. INPUT DATA (This line is overwritten by app.py automatically)
-PDB_FILE = "" 
+PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Sotorasib_fpocket_pocket4_complex.pdb'
 LIGAND_NAME = "UNL"            
 
 # --- OPTIMIZATION: TIGHTER BUFFER ---
 POCKET_RADIUS = 4.0            
 
 # 3. CALCULATION SETTINGS
-WORKING_DIR = BASE_DIR / "orca_calc_folder"
+# Changed from BASE_DIR / "orca_calc_folder" to BASE_DIR so batch_runner can find the files
+WORKING_DIR = BASE_DIR 
 INPUT_NAME  = "ligand.inp"
 OUTPUT_NAME = "ligand.out"
 
@@ -254,15 +255,9 @@ def main_workflow():
         print(f"CRITICAL: PDB file not found at {clean_pdb_path}")
         return
 
-    # Clean previous run
-    if WORKING_DIR.exists():
-        try:
-            shutil.rmtree(WORKING_DIR)
-        except OSError:
-            print("Warning: Could not fully clean working directory (files might be open).")
+    # NOTE: Directory cleaning (shutil.rmtree) has been safely removed. 
+    # batch_runner.py's _clean_dft_temps() handles isolated cleanup now.
     
-    WORKING_DIR.mkdir(exist_ok=True)
-
     print(f"Reading PDB: {clean_pdb_path}")
     atoms = get_pocket_atoms(clean_pdb_path, LIGAND_NAME, POCKET_RADIUS)
     

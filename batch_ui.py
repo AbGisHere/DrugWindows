@@ -204,7 +204,6 @@ def load_admet_results(protein_name: str, output_dir: str):
         gr.update(value=str(csv) if csv else None, visible=bool(csv)),
     )
 
-
 def load_dft_results(protein_name: str, output_dir: str):
     step = _protein_dir(output_dir, protein_name) / "08_dft"
     csv = _find_first(step, ["dft_batch_results.csv", "*.csv"])
@@ -213,7 +212,11 @@ def load_dft_results(protein_name: str, output_dir: str):
     cards = ""
     if not df.empty:
         last = df.iloc[-1]
-        cards = render_dft_cards(last.get("HOMO (eV)", "-"), last.get("LUMO (eV)", "-"), last.get("Band Gap (eV)", "-"))
+        # FIX: Updated keys to match exactly what dft.py outputs in the CSV
+        homo = last.get("HOMO_eV", "-")
+        lumo = last.get("LUMO_eV", "-")
+        gap = last.get("Gap_eV", "-")
+        cards = render_dft_cards(homo, lumo, gap)
 
     status = "✅ DFT results loaded from batch." if csv else "⚠️ DFT results not available for this batch."
     return (
@@ -222,7 +225,6 @@ def load_dft_results(protein_name: str, output_dir: str):
         gr.update(value=df, visible=not df.empty),
         gr.update(value=str(csv) if csv else None, visible=bool(csv)),
     )
-
 
 with gr.Blocks(theme=gr.themes.Soft(), title="Batch Protein Structure Finder & Analyzer") as demo:
     gr.HTML("<div class='main-header'><h1>🧬 Batch Protein Structure Finder & Analyzer</h1></div>")

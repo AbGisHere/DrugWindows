@@ -15,7 +15,7 @@ import gradio as gr
 from config import current_pdb_info, DOCKING_RESULTS_DIR, LIGAND_DIR, PRANKWEB_OUTPUT_DIR
 
 # Path to your Vina executable
-VINA_EXE = "vina.exe" 
+VINA_EXE = "Vina-GPU.exe" 
 
 def split_pdbqt_chains(pdbqt_path, output_base_dir):
     """Splits a prepared PDBQT file into separate PDBQT files based on TER records."""
@@ -167,7 +167,7 @@ def run_molecular_docking():
                         VINA_EXE, "--receptor", chain_receptor_pdbqt, "--ligand", ligand_pdbqt,
                         "--center_x", str(cx), "--center_y", str(cy), "--center_z", str(cz),
                         "--size_x", "25", "--size_y", "25", "--size_z", "25",
-                        "--exhaustiveness", "8", "--num_modes", "10", "--out", output_pdbqt_file
+                        "--num_modes", "10", "--out", output_pdbqt_file
                     ]
 
                     try:
@@ -249,7 +249,10 @@ def run_molecular_docking():
                                     print(f"PandaMap generation failed for {complex_file}: {pm_e}")
                             # ----------------------------
                     
-                    except subprocess.CalledProcessError: continue
+                    except subprocess.CalledProcessError as e: 
+                        print(f"🚨 DOCKING CRASHED for {ligand_name} in {pocket_name}!")
+                        print(f"Error Log: {e.stderr if e.stderr else e.stdout}")
+                        continue
                 
                 if ligand_best_poses:
                     ligand_best_poses.sort(key=lambda x: x['binding_energy'])

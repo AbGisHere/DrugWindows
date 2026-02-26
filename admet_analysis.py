@@ -449,19 +449,18 @@ def run_admet_prediction():
     final_df['Developability Score'] = dev_scores
     final_df['Final Decision'] = decisions
 
-    # 6. CLEANUP & SAVE
+   # 6. CLEANUP & SAVE
     # Sort by Score (Best first)
     final_df = final_df.sort_values(by=['Developability Score', 'Docking Score'], ascending=[False, True])
 
-    cols_to_keep = [c for c in DISPLAY_COLUMNS if c in final_df.columns]
-    final_df_clean = final_df[cols_to_keep]
-
-    numeric_cols = final_df_clean.select_dtypes(include=['float64', 'float32']).columns
-    final_df_clean.loc[:, numeric_cols] = final_df_clean[numeric_cols].round(2)
+    # KEEP ALL COLUMNS (Raw/Unfiltered)
+    # We just round the numeric columns so it doesn't look messy in the UI
+    numeric_cols = final_df.select_dtypes(include=['float64', 'float32']).columns
+    final_df.loc[:, numeric_cols] = final_df[numeric_cols].round(2)
 
     os.makedirs("results", exist_ok=True)
     csv_path = os.path.join("results", "final_admet_report.csv")
-    final_df_clean.to_csv(csv_path, index=False)
+    final_df.to_csv(csv_path, index=False)
     
-    msg = f"Analysis Complete. Generated report for {len(final_df_clean)} poses."
-    return msg, final_df_clean, csv_path
+    msg = f"Analysis Complete. Generated report for {len(final_df)} poses."
+    return msg, final_df, csv_path

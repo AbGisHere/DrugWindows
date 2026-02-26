@@ -13,6 +13,7 @@ import shutil
 import pandas as pd
 import gradio as gr
 from config import current_pdb_info, DOCKING_RESULTS_DIR, LIGAND_DIR, PRANKWEB_OUTPUT_DIR
+import time  # <-- Add this line
 
 # Path to your Vina executable
 VINA_EXE = "Vina-GPU.exe" 
@@ -171,7 +172,13 @@ def run_molecular_docking():
                     ]
 
                     try:
+                        # --- START TIMER ---
+                        start_time = time.time()
+                        
                         result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
+                        
+                        # --- STOP TIMER ---
+                        elapsed_time = time.time() - start_time
                         
                         # Parse Vina Output
                         for line in result.stdout.splitlines():
@@ -186,15 +193,13 @@ def run_molecular_docking():
                                                 'chain': chain_id,
                                                 'ligand': ligand_name,
                                                 'pocket': pocket_name,
-                                                # Coordinates added
                                                 'center_x': cx,
                                                 'center_y': cy,
                                                 'center_z': cz,
                                                 'pose_number': mode_num,
                                                 'binding_energy': affinity,
+                                                'docking_time_sec': round(elapsed_time, 2), # <-- ADDED TIME HERE
                                                 'pdb_file': os.path.join(output_dir_pdb, f"{ligand_name}_{pocket_name}_ligand.pdb")
-                                                # Removed: 'receptor_pdb_file'
-                                                # Removed: 'interaction_image' 
                                             })
                                     except ValueError: continue
 
@@ -263,7 +268,7 @@ def run_molecular_docking():
             summary_df = pd.DataFrame(summary_data)
             
             # Keep only the requested columns
-            cols = ['chain', 'ligand', 'pocket', 'center_x', 'center_y', 'center_z', 'pose_number', 'binding_energy', 'pdb_file']
+            cols = ['chain', 'ligand', 'pocket', 'center_x', 'center_y', 'center_z', 'pose_number', 'binding_energy', 'docking_time_sec', 'pdb_file']
             
             # Filter columns
             final_cols = [c for c in cols if c in summary_df.columns]

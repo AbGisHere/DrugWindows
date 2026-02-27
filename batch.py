@@ -629,8 +629,22 @@ class ProteinPipelineBatch:
             # Update dft.py with the single best file
             _update_dft_script_file(str(best_complex_path))
             
-            cmd = 'cmd /c "call activate orca_env && python dft.py"'
-            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            # --- START NEW CODE ---
+            orca_python = os.path.join("orca_env", "Scripts", "python.exe")
+            
+            if not os.path.exists(orca_python):
+                print(f"    ❌ Could not find environment at: {orca_python}")
+                return {"status": "failed", "message": "orca_env python not found"}
+
+            cmd = [orca_python, "dft.py"]
+            print(f"    -> Executing dft.py using {orca_python}...")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"    🚨 DFT Script Error Output:\n{result.stderr}")
+                print(f"    🚨 Standard Output (for debugging):\n{result.stdout}")
+            # --- END NEW CODE ---
             
             # 3. Handle outputs from the isolated temp folder
             if orca_temp.exists():

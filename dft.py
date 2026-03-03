@@ -20,14 +20,15 @@ if not ORCA_EXE.exists():
     ORCA_EXE = ORCA_FOLDER / "orca_startup_mpi.exe"
 
 # 2. INPUT DATA (This line is overwritten by app.py automatically)
-PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Sotorasib_p2rank_pocket1_complex.pdb'
+PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Alectinib_fpocket_pocket2_complex.pdb'
+
+# (Optional fallback) If auto-detect fails, it will look for this
 LIGAND_NAME = "UNL"            
 
 # --- OPTIMIZATION: TIGHTER BUFFER ---
-POCKET_RADIUS = 4.0            
+POCKET_RADIUS = 3.2          
 
 # 3. CALCULATION SETTINGS
-# Changed from BASE_DIR / "orca_calc_folder" to BASE_DIR so batch_runner can find the files
 WORKING_DIR = BASE_DIR / "orca_temp"
 WORKING_DIR.mkdir(exist_ok=True) # Ensure the temp folder exists
 
@@ -39,27 +40,48 @@ METRICS_CSV = WORKING_DIR / "dft_batch_results.csv"
 CHARGES_CSV = WORKING_DIR / "orca_mulliken_charges.csv"
 # ======================================================
 
-def get_pocket_atoms(pdb_path, lig_name, radius):
-    """Parses PDB and extracts the ligand + immediate environment."""
+def get_pocket_atoms(pdb_path, radius):
+    """Parses PDB and dynamically extracts the ligand + immediate environment."""
     parser = PDB.PDBParser(QUIET=True)
     try:
         structure = parser.get_structure("complex", pdb_path)
     except Exception as e:
-        print(f"Error reading PDB: {e}")
+        print(f"    ❌ Error reading PDB: {e}")
         return []
 
-    ligand_atoms = []
-    all_atoms = []
+    # 1. AUTO-DETECT LIGAND RESIDUE NAME
+    # Standard amino acids and common ignorables (water, simple ions)
+    std_aas = {'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 'LYS', 'LEU', 
+               'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER', 'THR', 'VAL', 'TRP', 'TYR'}
+    ignore_res = {'HOH', 'WAT', 'H2O', 'NA', 'CL', 'MG', 'ZN', 'CA', 'K'}
+    
+    ligand_resnames = set()
+    for res in structure.get_residues():
+        res_name = res.get_resname().strip()
+        # If it's not a standard amino acid and not water/simple ion
+        if res_name not in std_aas and res_name not in ignore_res:
+            ligand_resnames.add(res_name)
 
-    for atom in structure.get_atoms():
-        all_atoms.append(atom)
-        if atom.get_parent().get_resname() == lig_name:
+    # Fallback to the hardcoded name just in case the auto-detect filter was too strict
+    if not ligand_resnames:
+        ligand_resnames.add(LIGAND_NAME)
+        
+    detected_ligands = list(ligand_resnames)
+    print(f"    -> Auto-detected Ligand Residue Code(s): {detected_ligands}")
+
+    ligand_atoms = []
+    all_atoms = list(structure.get_atoms())
+
+    # Extract all atoms belonging to the dynamically detected ligand(s)
+    for atom in all_atoms:
+        if atom.get_parent().get_resname().strip() in detected_ligands:
             ligand_atoms.append(atom)
     
     if not ligand_atoms:
-        print(f"ERROR: Ligand '{lig_name}' not found in PDB.")
+        print(f"    ❌ ERROR: No atoms found for detected ligands {detected_ligands} in PDB.")
         return []
 
+    # 2. EXTRACT NEIGHBORS (POCKET BUFFER)
     ns = NeighborSearch(all_atoms)
     nearby_residues = set()
     
@@ -77,7 +99,8 @@ def get_pocket_atoms(pdb_path, lig_name, radius):
         formatted_lines.append(format_atom(atom))
         
     for res in nearby_residues:
-        if res.get_resname() != lig_name and res.get_resname() != "HOH":
+        res_name = res.get_resname().strip()
+        if res_name not in detected_ligands and res_name not in ignore_res:
             for atom in res.get_atoms():
                 formatted_lines.append(format_atom(atom))
                 
@@ -101,13 +124,13 @@ def write_orca_input(filepath, atom_lines, charge, mult):
         f.write("*\n")
 
 def run_orca_attempt(charge, mult, atoms):
-    print(f"\n--- Attempting Calculation: Charge {charge}, Multiplicity {mult} ---")
+    print(f"    --- Attempting Calculation: Charge {charge}, Multiplicity {mult} ---")
     
     inp_path = WORKING_DIR / INPUT_NAME
     write_orca_input(inp_path, atoms, charge, mult)
     
     if not inp_path.exists():
-        print(" >> ERROR: Input file creation failed.")
+        print("    >> ERROR: Input file creation failed.")
         return False
     
     env = os.environ.copy()
@@ -131,30 +154,29 @@ def run_orca_attempt(charge, mult, atoms):
             duration = time.time() - start_time
             
             if result.returncode == 0:
-                print(f" >> SUCCESS! Calculation finished in {duration:.1f} seconds.")
+                print(f"    >> SUCCESS! Calculation finished in {duration:.1f} seconds.")
                 return True
             else:
-                print(f" >> FAILED with code {result.returncode}")
+                print(f"    >> FAILED with code {result.returncode}")
                 err_msg = result.stderr.lower()
                 if "impossible" in err_msg and "electrons" in err_msg:
-                    print(" >> DIAGNOSIS: Electron count mismatch (Odd vs Even). Switching state...")
+                    print("    >> DIAGNOSIS: Electron count mismatch (Odd vs Even). Switching state...")
                 elif "mpiexec" in err_msg:
-                    print(" >> CRITICAL ERROR: MPI Issue Detected.")
+                    print("    >> CRITICAL ERROR: MPI Issue Detected.")
                 else:
-                    # Print last few lines of error log
-                    print(" >> ERROR DETAILS (Tail):")
+                    print("    >> ERROR DETAILS (Tail):")
                     print(result.stderr[-500:]) 
                 return False
 
         except Exception as e:
-            print(f" >> EXECUTION ERROR: {e}")
+            print(f"    >> EXECUTION ERROR: {e}")
             return False
 
 def extract_and_save_data(output_filepath, pdb_name, charge, mult):
     """Parses ORCA output and saves HOMO/LUMO/Gap and Charges to CSV."""
     
     if not os.path.exists(output_filepath):
-        print("Error: Output file not found for parsing.")
+        print("    Error: Output file not found for parsing.")
         return
 
     with open(output_filepath, 'r') as f:
@@ -172,23 +194,21 @@ def extract_and_save_data(output_filepath, pdb_name, charge, mult):
         
         # --- ORBITAL ENERGIES ---
         if "ORBITAL ENERGIES" in line:
-            # Look ahead for HOMO/LUMO transition
             for j in range(i + 4, min(i + 1000, len(lines))):
                 match = orb_pattern.match(lines[j])
                 if match:
                     occ = float(match.group(2))
-                    # Detect transition from Occupied (NOT 0) to Virtual (0)
                     if occ == 0.0000:
                         prev_match = orb_pattern.match(lines[j-1])
                         if prev_match:
-                            homo_val = float(prev_match.group(4)) # eV is group 4
-                            lumo_val = float(match.group(4))      # eV is group 4
+                            homo_val = float(prev_match.group(4))
+                            lumo_val = float(match.group(4))     
                             gap_val = round(lumo_val - homo_val, 4)
                         break
         
         # --- MULLIKEN CHARGES ---
         if "MULLIKEN ATOMIC CHARGES" in line:
-            mulliken_charges = [] # Reset to capture the final geometry (prevents reading intermediate steps)
+            mulliken_charges = [] 
             extract_mulliken = True
             continue
         
@@ -196,7 +216,6 @@ def extract_and_save_data(output_filepath, pdb_name, charge, mult):
             if "Sum of atomic charges" in line:
                 extract_mulliken = False
             elif ":" in line:
-                # Format example: "   0 C :   -0.123412"
                 parts = line.split(":")
                 if len(parts) == 2:
                     atom_info = parts[0].strip()
@@ -221,9 +240,9 @@ def extract_and_save_data(output_filepath, pdb_name, charge, mult):
                 lumo_val if lumo_val is not None else "NaN",
                 gap_val if gap_val is not None else "NaN"
             ])
-        print(f" >> Metrics saved to: {METRICS_CSV}")
+        print(f"    >> Metrics saved to: {METRICS_CSV.name}")
     except Exception as e:
-        print(f"Error saving metrics CSV: {e}")
+        print(f"    Error saving metrics CSV: {e}")
 
     # 3. SAVE CHARGES (Detailed breakdown)
     if mulliken_charges:
@@ -239,71 +258,58 @@ def extract_and_save_data(output_filepath, pdb_name, charge, mult):
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         pdb_name, atom_label, q_val
                     ])
-            print(f" >> Atomic charges saved to: {CHARGES_CSV}")
+            print(f"    >> Atomic charges saved to: {CHARGES_CSV.name}")
         except Exception as e:
-            print(f"Error saving charges CSV: {e}")
+            print(f"    Error saving charges CSV: {e}")
     else:
-        print(" >> Warning: No Mulliken charges found in output.")
+        print("    >> Warning: No Mulliken charges found in output.")
 
 def main_workflow():
     if not ORCA_EXE.exists():
-        print(f"CRITICAL: ORCA not found at {ORCA_EXE}")
+        print(f"    CRITICAL: ORCA not found at {ORCA_EXE}")
         return
     
-    # Clean string path if it came from Windows copy-paste
     clean_pdb_path = PDB_FILE.strip("'").strip('"')
     
     if not clean_pdb_path or not Path(clean_pdb_path).exists():
-        print(f"CRITICAL: PDB file not found at {clean_pdb_path}")
+        print(f"    CRITICAL: PDB file not found at {clean_pdb_path}")
         return
 
-    # NOTE: Directory cleaning (shutil.rmtree) has been safely removed. 
-    # batch_runner.py's _clean_dft_temps() handles isolated cleanup now.
-    
-    print(f"Reading PDB: {clean_pdb_path}")
-    atoms = get_pocket_atoms(clean_pdb_path, LIGAND_NAME, POCKET_RADIUS)
+    print(f"    Reading PDB: {clean_pdb_path}")
+    atoms = get_pocket_atoms(clean_pdb_path, POCKET_RADIUS)
     
     if not atoms: 
-        print("No atoms found. Check Ligand Name (UNL) and PDB format.")
+        print("    No atoms found. Check PDB format.")
         return
         
-    print(f"Extracted {len(atoms)} atoms (Dynamic Ligand Shape + {POCKET_RADIUS}A Buffer).")
+    print(f"    Extracted {len(atoms)} atoms (Dynamic Ligand Shape + {POCKET_RADIUS}A Buffer).")
 
     # ================= SMART STRATEGY =================
-    # Loop through valid chemical states until one works.
-    
     successful_run = False
     final_charge = 0
     final_mult = 1
 
-    # 1. Try Neutral Singlet (Standard State)
     if run_orca_attempt(0, 1, atoms):
         successful_run = True
         final_charge, final_mult = 0, 1
-    
-    # 2. Try Cationic Singlet (+1 Charge) if step 1 failed
     elif run_orca_attempt(1, 1, atoms):
         successful_run = True
         final_charge, final_mult = 1, 1
-        
-    # 3. Try Anionic Singlet (-1 Charge) if step 2 failed
     elif run_orca_attempt(-1, 1, atoms):
         successful_run = True
         final_charge, final_mult = -1, 1
-        
-    # 4. Try Neutral Doublet (Radical) if step 3 failed
     elif run_orca_attempt(0, 2, atoms):
         successful_run = True
         final_charge, final_mult = 0, 2
 
     if successful_run:
-        print("\n--- Parsing Results ---")
+        print("\n    --- Parsing Results ---")
         out_path = WORKING_DIR / OUTPUT_NAME
         extract_and_save_data(out_path, os.path.basename(clean_pdb_path), final_charge, final_mult)
-        print("Done.")
+        print("    Done.")
     else:
-        print("\nALL ATTEMPTS FAILED.")
-        print("Please check your PDB file or try manually capping residues.")
+        print("\n    ALL ATTEMPTS FAILED.")
+        print("    Please check your PDB file or try manually capping residues.")
 
 if __name__ == "__main__":
     main_workflow()

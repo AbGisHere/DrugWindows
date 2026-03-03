@@ -645,14 +645,9 @@ class ProteinPipelineBatch:
                 # Update dft.py with this specific file
                 _update_dft_script_file(str(best_complex_path))
                 
-                orca_python = os.path.join("orca_env", "Scripts", "python.exe")
-                
-                if not os.path.exists(orca_python):
-                    print(f"    ❌ Could not find environment at: {orca_python}")
-                    continue
-
-                cmd = [orca_python, "dft.py"]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                # Spawns a temporary shell to activate the env, run the script, and exit cleanly
+                command = 'cmd /c "call activate orca_env && python dft.py"'
+                result = subprocess.run(command, capture_output=True, text=True, shell=True)
                 
                 if result.returncode != 0:
                     print(f"    🚨 DFT Script Error Output:\n{result.stderr}")

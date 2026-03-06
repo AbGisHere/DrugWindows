@@ -20,7 +20,7 @@ if not ORCA_EXE.exists():
     ORCA_EXE = ORCA_FOLDER / "orca_startup_mpi.exe"
 
 # 2. INPUT DATA (This line is overwritten by app.py automatically)
-PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Alectinib_fpocket_pocket2_complex.pdb'
+PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Sotorasib_p2rank_pocket1_complex.pdb'
 
 # (Optional fallback) If auto-detect fails, it will look for this
 LIGAND_NAME = "UNL"            

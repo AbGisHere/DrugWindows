@@ -256,11 +256,9 @@ def run_orca_attempt(charge, mult, atoms, orca_exe, work_dir, nprocs,
 def run_quick_attempt(charge, mult, atoms, work_dir):
     inp_path = work_dir / "quick.inp"
     with open(inp_path, "w") as f:
-        f.write(f"PBE0 BASIS=DEF2-SVP CHARGE={charge} MULT={mult}\n")
-        f.write("geometry\n")
+        f.write(f"PBE0 BASIS=DEF2-SVP CHARGE={charge} MULT={mult} ENERGY\n\n")
         for line in atoms:
             f.write(line + "\n")
-        f.write("end\n")
     out_path = work_dir / OUTPUT_NAME
     quick_out = work_dir / "quick.out"
     try:

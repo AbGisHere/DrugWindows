@@ -262,11 +262,15 @@ def run_quick_attempt(charge, mult, atoms, work_dir):
             f.write(line + "\n")
         f.write("end\n")
     out_path = work_dir / OUTPUT_NAME
+    quick_out = work_dir / "quick.out"
     try:
         result = subprocess.run(["quick", "quick.inp"], cwd=str(work_dir),
                                 capture_output=True, text=True, timeout=JOB_TIMEOUT_S)
-        out_path.write_text(result.stdout)
-        return result.returncode == 0 and "THANK YOU FOR USING QUICK!" in result.stdout
+        # QUICK writes to quick.out, not stdout — copy it to ligand.out for parsing
+        if quick_out.exists():
+            out_path.write_text(quick_out.read_text(errors="ignore"))
+        content = out_path.read_text(errors="ignore") if out_path.exists() else ""
+        return result.returncode == 0 and "THANK YOU FOR USING QUICK!" in content
     except subprocess.TimeoutExpired:
         print(f"    [QUICK] Timed out after {JOB_TIMEOUT_S}s.")
         return False

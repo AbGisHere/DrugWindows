@@ -1,315 +1,463 @@
 import os
+import sys
 import subprocess
 import shutil
 import time
 import re
 import csv
+import platform
+import hashlib
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
 from Bio import PDB
 from Bio.PDB.NeighborSearch import NeighborSearch
 
-# ================= USER CONFIGURATION =================
-# 1. ORCA SETUP
-BASE_DIR = Path(os.getcwd()).resolve()
+# ================= HARDWARE DETECTION =================
+
+def get_available_ram_mb() -> int:
+    system = platform.system()
+    try:
+        if system == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        elif system == "Darwin":
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True)
+            if out.returncode == 0:
+                return int(out.stdout.strip()) // (1024 * 1024)
+        elif system == "Windows":
+            out = subprocess.run(
+                ["wmic", "OS", "get", "FreePhysicalMemory", "/Value"],
+                capture_output=True, text=True)
+            if out.returncode == 0:
+                m = re.search(r"FreePhysicalMemory=(\d+)", out.stdout)
+                if m:
+                    return int(m.group(1)) // 1024
+    except Exception:
+        pass
+    return 16 * 1024
+
+
+def detect_gpus() -> list:
+    """Returns [(gpu_id, free_vram_mb), ...] or [] if unavailable."""
+    if platform.system() == "Darwin":
+        return []
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True)
+        if out.returncode == 0:
+            gpus = []
+            for line in out.stdout.strip().splitlines():
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    gpus.append((int(parts[0].strip()), int(parts[1].strip())))
+            return gpus
+    except Exception:
+        pass
+    return []
+
+
+def get_hardware_specs() -> dict:
+    gpus = detect_gpus()
+    return {
+        "os": platform.system(),
+        "cpu_cores": os.cpu_count() or 1,
+        "gpus": gpus,
+        "gpu_available": len(gpus) > 0,
+        "ram_mb": get_available_ram_mb(),
+        "quick_found": shutil.which("quick") is not None,
+        "mpi_found": (shutil.which("mpiexec") or shutil.which("mpirun")) is not None,
+    }
+
+
+def compute_job_resources(specs: dict, n_jobs: int) -> tuple:
+    """Returns (nprocs, max_core_mb) to assign to a single ORCA job."""
+    usable_cores = max(1, specs["cpu_cores"] - 2)
+    nprocs = max(1, usable_cores // max(1, n_jobs))
+    usable_ram = specs["ram_mb"] * 0.70
+    ram_per_job = usable_ram / max(1, n_jobs)
+    max_core = max(256, int(ram_per_job // nprocs))
+    return nprocs, max_core
+
+
+# ================= PATHS & CONSTANTS =================
+
+BASE_DIR    = Path(os.getcwd()).resolve()
 ORCA_FOLDER = BASE_DIR / "orca_program"
+if platform.system() == "Windows":
+    ORCA_EXE = ORCA_FOLDER / "orca.exe"
+else:
+    _detected = shutil.which("orca")
+    # Guard against Linux screen reader also named "orca" (/usr/bin/orca)
+    if _detected and Path(_detected).parent == Path("/usr/bin"):
+        _detected = None
+    ORCA_EXE  = Path(_detected) if _detected else ORCA_FOLDER / "orca"
 
-# Detect ORCA executable
-ORCA_EXE = ORCA_FOLDER / "orca.exe" 
-if not ORCA_EXE.exists():
-    ORCA_EXE = ORCA_FOLDER / "orca_startup_mpi.exe"
-
-# 2. INPUT DATA (This line is overwritten by app.py automatically)
-PDB_FILE = 'docking_results\\Chain_A\\docked_pdb\\Sotorasib_p2rank_pocket1_complex.pdb'
-
-# (Optional fallback) If auto-detect fails, it will look for this
-LIGAND_NAME = "UNL"            
-
-# --- OPTIMIZATION: TIGHTER BUFFER ---
-POCKET_RADIUS = 3.2          
-
-# 3. CALCULATION SETTINGS
+PDB_FILE = Path('p2rank_2.5.1') / '4LKS.pdb'
+LIGAND_NAME = "UNL"
+POCKET_RADIUS = 3.2
 WORKING_DIR = BASE_DIR / "orca_temp"
-WORKING_DIR.mkdir(exist_ok=True) # Ensure the temp folder exists
-
-INPUT_NAME  = "ligand.inp"
+INPUT_NAME = "ligand.inp"
 OUTPUT_NAME = "ligand.out"
-
-# 4. OUTPUT CSV FILES
 METRICS_CSV = WORKING_DIR / "dft_batch_results.csv"
-CHARGES_CSV = WORKING_DIR / "orca_mulliken_charges.csv"
-# ======================================================
+JOB_TIMEOUT_S = 14400   # 4 hours max per DFT job
+MAX_CPU_WORKERS = 8     # cap for CPU-only parallel runs
+
+# ================= ATOMIC DATA =================
+
+Z_MAP = {
+    'H': 1,  'HE': 2,  'LI': 3,  'BE': 4,  'B': 5,  'C': 6,  'N': 7,  'O': 8,  'F': 9,  'NE': 10,
+    'NA': 11, 'MG': 12, 'AL': 13, 'SI': 14, 'P': 15, 'S': 16, 'CL': 17, 'AR': 18,
+    'K': 19,  'CA': 20, 'FE': 26, 'CU': 29, 'ZN': 30, 'BR': 35, 'I': 53,
+}
+
+def get_total_electrons(atom_lines):
+    total_z = 0
+    for line in atom_lines:
+        symbol = line.split()[0].upper()
+        total_z += Z_MAP.get(symbol, 6)
+    return total_z
+
+# ================= CACHING =================
+
+def get_atom_hash(atom_lines: list) -> str:
+    return hashlib.md5("\n".join(sorted(atom_lines)).encode()).hexdigest()[:12]
+
+
+def is_cached(csv_path: Path, atom_hash: str) -> bool:
+    if not csv_path.exists():
+        return False
+    try:
+        return atom_hash in csv_path.read_text(errors="ignore")
+    except Exception:
+        return False
+
+# ================= POCKET EXTRACTION =================
 
 def get_pocket_atoms(pdb_path, radius):
-    """Parses PDB and dynamically extracts the ligand + immediate environment."""
     parser = PDB.PDBParser(QUIET=True)
     try:
         structure = parser.get_structure("complex", pdb_path)
     except Exception as e:
-        print(f"    ❌ Error reading PDB: {e}")
+        print(f"    Error reading PDB: {e}")
         return []
 
-    # 1. AUTO-DETECT LIGAND RESIDUE NAME
-    # Standard amino acids and common ignorables (water, simple ions)
-    std_aas = {'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 'LYS', 'LEU', 
-               'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER', 'THR', 'VAL', 'TRP', 'TYR'}
+    std_aas = {
+        'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 'LYS', 'LEU',
+        'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER', 'THR', 'VAL', 'TRP', 'TYR',
+    }
     ignore_res = {'HOH', 'WAT', 'H2O', 'NA', 'CL', 'MG', 'ZN', 'CA', 'K'}
-    
+
     ligand_resnames = set()
     for res in structure.get_residues():
-        res_name = res.get_resname().strip()
-        # If it's not a standard amino acid and not water/simple ion
-        if res_name not in std_aas and res_name not in ignore_res:
-            ligand_resnames.add(res_name)
+        resname = res.get_resname().strip()
+        if resname not in std_aas and resname not in ignore_res:
+            ligand_resnames.add(resname)
 
-    # Fallback to the hardcoded name just in case the auto-detect filter was too strict
     if not ligand_resnames:
         ligand_resnames.add(LIGAND_NAME)
-        
     detected_ligands = list(ligand_resnames)
     print(f"    -> Auto-detected Ligand Residue Code(s): {detected_ligands}")
 
-    ligand_atoms = []
     all_atoms = list(structure.get_atoms())
-
-    # Extract all atoms belonging to the dynamically detected ligand(s)
-    for atom in all_atoms:
-        if atom.get_parent().get_resname().strip() in detected_ligands:
-            ligand_atoms.append(atom)
-    
+    ligand_atoms = [a for a in all_atoms
+                    if a.get_parent().get_resname().strip() in detected_ligands]
     if not ligand_atoms:
-        print(f"    ❌ ERROR: No atoms found for detected ligands {detected_ligands} in PDB.")
         return []
 
-    # 2. EXTRACT NEIGHBORS (POCKET BUFFER)
     ns = NeighborSearch(all_atoms)
     nearby_residues = set()
-    
     for latom in ligand_atoms:
-        neighbors = ns.search(latom.get_coord(), radius, level='R')
-        nearby_residues.update(neighbors)
+        nearby_residues.update(ns.search(latom.get_coord(), radius, level='R'))
 
-    formatted_lines = []
     def format_atom(atom):
         x, y, z = atom.get_coord()
-        element = ''.join([i for i in atom.element if not i.isdigit()])
+        element = ''.join(i for i in (atom.element or atom.get_name() or 'C') if not i.isdigit()).strip() or 'C'
         return f"{element:<2} {x:12.6f} {y:12.6f} {z:12.6f}"
 
-    for atom in ligand_atoms:
-        formatted_lines.append(format_atom(atom))
-        
+    formatted_lines = [format_atom(a) for a in ligand_atoms]
     for res in nearby_residues:
-        res_name = res.get_resname().strip()
-        if res_name not in detected_ligands and res_name not in ignore_res:
-            for atom in res.get_atoms():
-                formatted_lines.append(format_atom(atom))
-                
+        resname = res.get_resname().strip()
+        if resname not in detected_ligands and resname not in ignore_res:
+            formatted_lines.extend(format_atom(a) for a in res.get_atoms())
+
     return formatted_lines
 
-def write_orca_input(filepath, atom_lines, charge, mult):
-    """Writes the .inp file with High-Speed settings."""
-    mpi_path = shutil.which("mpiexec")
-    
+# ================= ORCA INPUT =================
+
+def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
+                     use_mpi, use_gpu):
     with open(filepath, "w") as f:
-        f.write("! r2SCAN-3c Opt\n\n")  # Efficient composite method
-        
-        if mpi_path:
-            f.write("%pal nprocs 16 end\n\n")
+        if use_gpu:
+            f.write("! r2SCAN-3c RIJCOSX TightSCF\n")
+            f.write("%method\n  COSX_GridX 5\n  COSX_GridXFinal 6\nend\n")
         else:
-            print("   [Info] MS-MPI not found. Switching to Serial mode (1 core).")
-        
-        f.write(f"* xyz {charge} {mult}\n")
+            f.write("! r2SCAN-3c\n")
+        f.write(f"%maxcore {max_core}\n")
+        if use_mpi and nprocs > 1:
+            f.write(f"%pal nprocs {nprocs} end\n")
+        else:
+            print("   [Info] Running Serial (1 Core).")
+        f.write(f"\n* xyz {charge} {mult}\n")
         for line in atom_lines:
             f.write(line + "\n")
         f.write("*\n")
 
-def run_orca_attempt(charge, mult, atoms):
-    print(f"    --- Attempting Calculation: Charge {charge}, Multiplicity {mult} ---")
-    
-    inp_path = WORKING_DIR / INPUT_NAME
-    write_orca_input(inp_path, atoms, charge, mult)
-    
-    if not inp_path.exists():
-        print("    >> ERROR: Input file creation failed.")
-        return False
-    
-    env = os.environ.copy()
-    if str(ORCA_FOLDER) not in env["PATH"]:
-        env["PATH"] = str(ORCA_FOLDER) + os.pathsep + env["PATH"]
-        
-    out_path = WORKING_DIR / OUTPUT_NAME
+# ================= ORCA EXECUTION =================
+
+def run_orca_attempt(charge, mult, atoms, orca_exe, work_dir, nprocs,
+                     max_core, use_mpi, use_gpu, env):
+    print(f"    [ORCA] Attempting: Charge {charge}, Multiplicity {mult}")
+    inp_path = work_dir / INPUT_NAME
+    out_path = work_dir / OUTPUT_NAME
+
+    write_orca_input(inp_path, atoms, charge, mult, nprocs, max_core,
+                     use_mpi, use_gpu)
     start_time = time.time()
-    
-    with open(out_path, "w") as outfile:
-        try:
-            result = subprocess.run(
-                [str(ORCA_EXE), INPUT_NAME], 
-                cwd=str(WORKING_DIR),
-                stdout=outfile,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env
-            )
-            
-            duration = time.time() - start_time
-            
-            if result.returncode == 0:
-                print(f"    >> SUCCESS! Calculation finished in {duration:.1f} seconds.")
-                return True
-            else:
-                print(f"    >> FAILED with code {result.returncode}")
-                err_msg = result.stderr.lower()
-                if "impossible" in err_msg and "electrons" in err_msg:
-                    print("    >> DIAGNOSIS: Electron count mismatch (Odd vs Even). Switching state...")
-                elif "mpiexec" in err_msg:
-                    print("    >> CRITICAL ERROR: MPI Issue Detected.")
-                else:
-                    print("    >> ERROR DETAILS (Tail):")
-                    print(result.stderr[-500:]) 
-                return False
 
-        except Exception as e:
-            print(f"    >> EXECUTION ERROR: {e}")
-            return False
-
-def extract_and_save_data(output_filepath, pdb_name, charge, mult):
-    """Parses ORCA output and saves HOMO/LUMO/Gap and Charges to CSV."""
-    
-    if not os.path.exists(output_filepath):
-        print("    Error: Output file not found for parsing.")
-        return
-
-    with open(output_filepath, 'r') as f:
-        lines = f.readlines()
-
-    homo_val, lumo_val, gap_val = None, None, None
-    mulliken_charges = []
-    
-    # Regex for orbital energies: Index, Occ, Energy(Eh), Energy(eV)
-    orb_pattern = re.compile(r"^\s*(\d+)\s+([0-9.]+)\s+([-0-9.]+)\s+([-0-9.]+)")
-    
-    # 1. PARSE FILE
-    extract_mulliken = False
-    for i, line in enumerate(lines):
-        
-        # --- ORBITAL ENERGIES ---
-        if "ORBITAL ENERGIES" in line:
-            for j in range(i + 4, min(i + 1000, len(lines))):
-                match = orb_pattern.match(lines[j])
-                if match:
-                    occ = float(match.group(2))
-                    if occ == 0.0000:
-                        prev_match = orb_pattern.match(lines[j-1])
-                        if prev_match:
-                            homo_val = float(prev_match.group(4))
-                            lumo_val = float(match.group(4))     
-                            gap_val = round(lumo_val - homo_val, 4)
-                        break
-        
-        # --- MULLIKEN CHARGES ---
-        if "MULLIKEN ATOMIC CHARGES" in line:
-            mulliken_charges = [] 
-            extract_mulliken = True
-            continue
-        
-        if extract_mulliken:
-            if "Sum of atomic charges" in line:
-                extract_mulliken = False
-            elif ":" in line:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    atom_info = parts[0].strip()
-                    try:
-                        charge_val = float(parts[1].strip())
-                        mulliken_charges.append((atom_info, charge_val))
-                    except ValueError:
-                        pass
-
-    # 2. SAVE METRICS (HOMO, LUMO, Gap)
-    file_exists = METRICS_CSV.exists()
     try:
-        with open(METRICS_CSV, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Timestamp", "Filename", "Charge", "Multiplicity", "HOMO_eV", "LUMO_eV", "Gap_eV"])
-            
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                pdb_name, charge, mult,
-                homo_val if homo_val is not None else "NaN",
-                lumo_val if lumo_val is not None else "NaN",
-                gap_val if gap_val is not None else "NaN"
-            ])
-        print(f"    >> Metrics saved to: {METRICS_CSV.name}")
-    except Exception as e:
-        print(f"    Error saving metrics CSV: {e}")
+        with open(out_path, "w") as outfile:
+            subprocess.run([str(orca_exe), INPUT_NAME], cwd=str(work_dir),
+                           stdout=outfile, stderr=subprocess.PIPE,
+                           text=True, env=env, timeout=JOB_TIMEOUT_S)
+        duration = time.time() - start_time
+        content = out_path.read_text(errors="ignore") if out_path.exists() else ""
 
-    # 3. SAVE CHARGES (Detailed breakdown)
-    if mulliken_charges:
-        file_exists = CHARGES_CSV.exists()
-        try:
-            with open(CHARGES_CSV, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(["Timestamp", "Filename", "Atom_Index_Element", "Mulliken_Charge"])
-                
-                for atom_label, q_val in mulliken_charges:
-                    writer.writerow([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        pdb_name, atom_label, q_val
-                    ])
-            print(f"    >> Atomic charges saved to: {CHARGES_CSV.name}")
-        except Exception as e:
-            print(f"    Error saving charges CSV: {e}")
+        if "ORCA TERMINATED NORMALLY" in content:
+            print(f"    >> SUCCESS in {duration:.1f}s.")
+            return True
+
+        # MPI failure → single fallback attempt (no recursion, no sentinel file)
+        mpi_error_keywords = ("Startup", "MPI_Init", "mpirun", "aborting")
+        if use_mpi and any(kw in content for kw in mpi_error_keywords):
+            print("    [Fallback] MPI failure detected. Dropping to serial mode...")
+            write_orca_input(inp_path, atoms, charge, mult, 1,
+                             max_core * max(nprocs, 1), False, use_gpu)
+            with open(out_path, "w") as outfile:
+                subprocess.run([str(orca_exe), INPUT_NAME], cwd=str(work_dir),
+                               stdout=outfile, stderr=subprocess.PIPE,
+                               text=True, env=env, timeout=JOB_TIMEOUT_S)
+            content = out_path.read_text(errors="ignore") if out_path.exists() else ""
+            if "ORCA TERMINATED NORMALLY" in content:
+                print("    >> SUCCESS (serial fallback).")
+                return True
+    except subprocess.TimeoutExpired:
+        print(f"    [ORCA] Timed out after {JOB_TIMEOUT_S}s.")
+    except Exception:
+        pass
+
+    return False
+
+
+def run_quick_attempt(charge, mult, atoms, work_dir):
+    inp_path = work_dir / "quick.inp"
+    with open(inp_path, "w") as f:
+        f.write(f"method R2SCAN\ndispersion d3bj\nbasis def2-SVP\n"
+                f"charge {charge}\nmultiplicity {mult}\ngeometry\n")
+        for line in atoms:
+            f.write(line + "\n")
+        f.write("end\n")
+    out_path = work_dir / OUTPUT_NAME
+    try:
+        result = subprocess.run(["quick", "quick.inp"], cwd=str(work_dir),
+                                capture_output=True, text=True, timeout=JOB_TIMEOUT_S)
+        out_path.write_text(result.stdout)
+        return result.returncode == 0 and "THANK YOU FOR USING QUICK!" in result.stdout
+    except subprocess.TimeoutExpired:
+        print(f"    [QUICK] Timed out after {JOB_TIMEOUT_S}s.")
+        return False
+    except Exception:
+        return False
+
+# ================= RESULT EXTRACTION =================
+
+def extract_result_dict(output_filepath, pdb_name, charge, mult, atom_hash):
+    """Parse ORCA/QUICK output. Returns dict or None."""
+    out = Path(output_filepath)
+    if not out.exists():
+        return None
+    content = out.read_text(errors="ignore")
+
+    homo_val = lumo_val = gap_val = None
+    if "HOMO ENERGY:" in content:
+        # QUICK output: HOMO/LUMO reported directly in eV
+        homo_match = re.search(r"HOMO ENERGY:\s+[-\d.]+\s+A\.U\.,\s+([-\d.]+)\s+EV", content)
+        lumo_match = re.search(r"LUMO ENERGY:\s+[-\d.]+\s+A\.U\.,\s+([-\d.]+)\s+EV", content)
+        if homo_match and lumo_match:
+            homo_val = float(homo_match.group(1))
+            lumo_val = float(lumo_match.group(1))
+            gap_val  = round(lumo_val - homo_val, 4)
+    elif "ORBITAL ENERGIES" in content:
+        # ORCA output: scan occupation table for HOMO/LUMO boundary
+        orb_match = re.findall(
+            r"(\d+)\s+([0-9\.]+)\s+([-0-9\.]+)\s+([-0-9\.]+)", content)
+        for i, match in enumerate(orb_match):
+            try:
+                if float(match[1]) == 0.0 and i > 0:
+                    homo_val = float(orb_match[i - 1][3])
+                    lumo_val = float(match[3])
+                    gap_val  = round(lumo_val - homo_val, 4)
+                    break
+            except Exception:
+                continue
+
+    engine = "QUICK" if "HOMO ENERGY:" in content else "ORCA"
+    return {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Filename":  pdb_name,
+        "Engine":    engine,
+        "Charge":    charge,
+        "Mult":      mult,
+        "HOMO_eV":   homo_val if homo_val is not None else "NaN",
+        "LUMO_eV":   lumo_val if lumo_val is not None else "NaN",
+        "Gap_eV":    gap_val  if gap_val  is not None else "NaN",
+        "AtomHash":  atom_hash,
+    }
+
+
+def write_results_to_csv(csv_path: Path, result_rows: list) -> None:
+    if not result_rows:
+        return
+    fieldnames = ["Timestamp", "Filename", "Engine", "Charge", "Mult",
+                  "HOMO_eV", "LUMO_eV", "Gap_eV", "AtomHash"]
+    file_exists = csv_path.exists()
+    with open(csv_path, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        if not file_exists:
+            writer.writeheader()
+        for row in result_rows:
+            writer.writerow(row)
+
+# ================= WORKER (picklable for ProcessPoolExecutor) =================
+
+def process_single_pdb(job_args: tuple):
+    """Runs one PDB through DFT. Returns result dict or None."""
+    (pdb_path_str, gpu_id, nprocs, max_core, use_mpi,
+     specs, orca_exe_str, orca_folder_str, base_dir_str) = job_args
+
+    pdb_path   = Path(pdb_path_str)
+    orca_exe   = Path(orca_exe_str)
+    orca_folder = Path(orca_folder_str)
+    base_dir   = Path(base_dir_str)
+    metrics_csv = base_dir / "orca_temp" / "dft_batch_results.csv"
+
+    if not pdb_path.exists():
+        print(f"    [Worker] PDB not found: {pdb_path}")
+        return None
+
+    work_dir = base_dir / "orca_temp" / pdb_path.stem
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    atoms = get_pocket_atoms(pdb_path, POCKET_RADIUS)
+    if not atoms:
+        print(f"    [Worker] No pocket atoms found in {pdb_path.name}")
+        return None
+
+    atom_hash = get_atom_hash(atoms)
+    if is_cached(metrics_csv, atom_hash):
+        print(f"    [Worker] Cache hit for {pdb_path.name} (hash {atom_hash})")
+        return None
+
+    env = os.environ.copy()
+    if str(orca_folder) not in env.get("PATH", ""):
+        env["PATH"] = str(orca_folder) + os.pathsep + env.get("PATH", "")
+    if gpu_id >= 0:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # RIJCOSX only on Linux/Windows with a real CUDA GPU
+    use_gpu = (gpu_id >= 0
+               and specs.get("gpu_available", False)
+               and specs.get("os") != "Darwin")
+
+    total_z = get_total_electrons(atoms)
+    print(f"    -> Total Nuclei Charge (Electrons): {total_z}")
+
+    candidates = []
+    for charge in [0, 1, -1]:
+        electrons = total_z - charge
+        mult = 1 if (electrons % 2 == 0) else 2
+        candidates.append((charge, mult))
+
+    use_quick = specs.get("gpu_available", False) and specs.get("quick_found", False)
+
+    for c, m in candidates:
+        if use_quick:
+            success = run_quick_attempt(c, m, atoms, work_dir)
+            if not success:
+                print(f"    [Fallback] QUICK failed for charge={c}. Trying ORCA...")
+                success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
+                                           nprocs, max_core, use_mpi, use_gpu, env)
+        else:
+            success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
+                                       nprocs, max_core, use_mpi, use_gpu, env)
+        if success:
+            return extract_result_dict(work_dir / OUTPUT_NAME,
+                                       pdb_path.name, c, m, atom_hash)
+
+    print(f"    All attempts failed for {pdb_path.name}. Check {work_dir / OUTPUT_NAME}")
+    return None
+
+# ================= MAIN WORKFLOW =================
+
+def main_workflow(pdb_files=None):
+    WORKING_DIR.mkdir(exist_ok=True)
+
+    specs = get_hardware_specs()
+    print(f"    System: {specs['os']} | CPU: {specs['cpu_cores']} "
+          f"| RAM: {specs['ram_mb']} MB | GPU: {specs['gpu_available']}")
+    if specs['gpus']:
+        print(f"    GPUs: {specs['gpus']}")
+
+    # Determine job list
+    if pdb_files is None:
+        # batch.py mode: single job from the module-level PDB_FILE
+        job_paths = [Path(PDB_FILE)]
     else:
-        print("    >> Warning: No Mulliken charges found in output.")
+        job_paths = [Path(p) for p in pdb_files]
 
-def main_workflow():
-    if not ORCA_EXE.exists():
-        print(f"    CRITICAL: ORCA not found at {ORCA_EXE}")
-        return
-    
-    clean_pdb_path = PDB_FILE.strip("'").strip('"')
-    
-    if not clean_pdb_path or not Path(clean_pdb_path).exists():
-        print(f"    CRITICAL: PDB file not found at {clean_pdb_path}")
+    job_paths = [p for p in job_paths if p.exists()]
+    if not job_paths:
+        print("    No valid PDB files to process.")
         return
 
-    print(f"    Reading PDB: {clean_pdb_path}")
-    atoms = get_pocket_atoms(clean_pdb_path, POCKET_RADIUS)
-    
-    if not atoms: 
-        print("    No atoms found. Check PDB format.")
-        return
-        
-    print(f"    Extracted {len(atoms)} atoms (Dynamic Ligand Shape + {POCKET_RADIUS}A Buffer).")
+    n_jobs = len(job_paths)
+    nprocs, max_core = compute_job_resources(specs, n_jobs)
+    # macOS ORCA binaries are serial-only; system mpirun version rarely matches
+    use_mpi = specs["mpi_found"] and specs["os"] != "Darwin"
 
-    # ================= SMART STRATEGY =================
-    successful_run = False
-    final_charge = 0
-    final_mult = 1
-
-    if run_orca_attempt(0, 1, atoms):
-        successful_run = True
-        final_charge, final_mult = 0, 1
-    elif run_orca_attempt(1, 1, atoms):
-        successful_run = True
-        final_charge, final_mult = 1, 1
-    elif run_orca_attempt(-1, 1, atoms):
-        successful_run = True
-        final_charge, final_mult = -1, 1
-    elif run_orca_attempt(0, 2, atoms):
-        successful_run = True
-        final_charge, final_mult = 0, 2
-
-    if successful_run:
-        print("\n    --- Parsing Results ---")
-        out_path = WORKING_DIR / OUTPUT_NAME
-        extract_and_save_data(out_path, os.path.basename(clean_pdb_path), final_charge, final_mult)
-        print("    Done.")
+    gpus = specs["gpus"]
+    if gpus:
+        n_workers = len(gpus)
+        gpu_ids = [gpus[i % len(gpus)][0] for i in range(n_jobs)]
     else:
-        print("\n    ALL ATTEMPTS FAILED.")
-        print("    Please check your PDB file or try manually capping residues.")
+        n_workers = min(max(1, specs["cpu_cores"] // 4), MAX_CPU_WORKERS)
+        gpu_ids = [-1] * n_jobs
+
+    job_args = [
+        (str(job_paths[i]), gpu_ids[i], nprocs, max_core, use_mpi,
+         specs, str(ORCA_EXE), str(ORCA_FOLDER), str(BASE_DIR))
+        for i in range(n_jobs)
+    ]
+
+    if n_jobs == 1:
+        results = [process_single_pdb(job_args[0])]
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            results = list(executor.map(process_single_pdb, job_args))
+
+    result_rows = [r for r in results if r is not None]
+    if result_rows:
+        write_results_to_csv(METRICS_CSV, result_rows)
+        print(f"\n    Results written to {METRICS_CSV}")
+    else:
+        print("\n    No results to write.")
+
 
 if __name__ == "__main__":
-    main_workflow()
+    pdbs = [Path(a) for a in sys.argv[1:] if a.endswith(".pdb")]
+    main_workflow(pdbs if pdbs else None)

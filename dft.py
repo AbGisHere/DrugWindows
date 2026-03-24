@@ -195,7 +195,6 @@ def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
     with open(filepath, "w") as f:
         if use_gpu:
             f.write("! r2SCAN-3c RIJCOSX TightSCF\n")
-            f.write("%method\n  COSX_GridX 5\n  COSX_GridXFinal 6\nend\n")
         else:
             f.write("! r2SCAN-3c\n")
         f.write(f"%maxcore {max_core}\n")

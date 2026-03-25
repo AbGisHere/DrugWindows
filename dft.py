@@ -70,7 +70,10 @@ def get_hardware_specs() -> dict:
         "gpus": gpus,
         "gpu_available": len(gpus) > 0,
         "ram_mb": get_available_ram_mb(),
-        "quick_found": shutil.which("quick") is not None,
+        "quick_exe": (shutil.which("quick.cuda") or shutil.which("quick.cuda.MPI")
+                      or shutil.which("quick")) if (len(gpus) > 0) else shutil.which("quick"),
+        "quick_found": (shutil.which("quick.cuda") or shutil.which("quick.cuda.MPI")
+                        or shutil.which("quick")) is not None,
         "mpi_found": (shutil.which("mpiexec") or shutil.which("mpirun")) is not None,
     }
 
@@ -253,7 +256,7 @@ def run_orca_attempt(charge, mult, atoms, orca_exe, work_dir, nprocs,
     return False
 
 
-def run_quick_attempt(charge, mult, atoms, work_dir):
+def run_quick_attempt(charge, mult, atoms, work_dir, quick_exe="quick"):
     inp_path = work_dir / "quick.inp"
     with open(inp_path, "w") as f:
         f.write(f"PBE0 BASIS=DEF2-SVP CHARGE={charge} MULT={mult} ENERGY\n\n")
@@ -262,7 +265,7 @@ def run_quick_attempt(charge, mult, atoms, work_dir):
     out_path = work_dir / OUTPUT_NAME
     quick_out = work_dir / "quick.out"
     try:
-        result = subprocess.run(["quick", "quick.inp"], cwd=str(work_dir),
+        result = subprocess.run([quick_exe, "quick.inp"], cwd=str(work_dir),
                                 capture_output=True, text=True, timeout=JOB_TIMEOUT_S)
         # QUICK writes to quick.out, not stdout — copy it to ligand.out for parsing
         if quick_out.exists():
@@ -388,7 +391,8 @@ def process_single_pdb(job_args: tuple):
 
     for c, m in candidates:
         if use_quick:
-            success = run_quick_attempt(c, m, atoms, work_dir)
+            quick_exe = specs.get("quick_exe") or "quick"
+            success = run_quick_attempt(c, m, atoms, work_dir, quick_exe)
             if not success:
                 print(f"    [Fallback] QUICK failed for charge={c}. Trying ORCA...")
                 success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,

@@ -7,6 +7,7 @@ import re
 import csv
 import platform
 import hashlib
+import importlib.util
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
@@ -74,6 +75,7 @@ def get_hardware_specs() -> dict:
                       or shutil.which("quick")) if (len(gpus) > 0) else shutil.which("quick"),
         "quick_found": (shutil.which("quick.cuda") or shutil.which("quick.cuda.MPI")
                         or shutil.which("quick")) is not None,
+        "pyscf_found": importlib.util.find_spec("gpu4pyscf") is not None,
         "mpi_found": (shutil.which("mpiexec") or shutil.which("mpirun")) is not None,
     }
 
@@ -278,6 +280,60 @@ def run_quick_attempt(charge, mult, atoms, work_dir, quick_exe="quick"):
     except Exception:
         return False
 
+# ================= PYSCF (GPU4PySCF) =================
+
+HARTREE_TO_EV = 27.2114
+
+def run_pyscf_attempt(charge, mult, atoms, work_dir, gpu_id):
+    """Run PBE0/def2-SVP via GPU4PySCF with SOSCF. Returns (homo_ev, lumo_ev, gap_ev) or None."""
+    if gpu_id >= 0:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    try:
+        import numpy as np
+        from pyscf import gto
+        from gpu4pyscf import dft as gpu_dft
+
+        mol = gto.Mole()
+        mol.atom = "\n".join(atoms)
+        mol.basis = "def2-svp"
+        mol.charge = charge
+        mol.spin = mult - 1
+        mol.verbose = 3
+        mol.output = str(work_dir / "pyscf.log")
+        mol.build()
+
+        mf = gpu_dft.RKS(mol) if mult == 1 else gpu_dft.UKS(mol)
+        mf.xc = "pbe0"
+        mf.conv_tol = 1e-8
+        mf.max_cycle = 200
+        mf = mf.newton()  # SOSCF — handles near-degenerate systems
+        mf.kernel()
+
+        if not mf.converged:
+            print(f"    [PySCF] SCF did not converge for charge={charge}.")
+            return None
+
+        if mult == 1:
+            mo_e = np.asarray(mf.mo_energy)
+            mo_o = np.asarray(mf.mo_occ)
+            homo_ev = float(mo_e[mo_o > 0][-1]) * HARTREE_TO_EV
+            lumo_ev = float(mo_e[mo_o == 0][0]) * HARTREE_TO_EV
+        else:
+            mo_ea, mo_oa = np.asarray(mf.mo_energy[0]), np.asarray(mf.mo_occ[0])
+            mo_eb, mo_ob = np.asarray(mf.mo_energy[1]), np.asarray(mf.mo_occ[1])
+            homo_ev = max(float(mo_ea[mo_oa > 0][-1]), float(mo_eb[mo_ob > 0][-1])) * HARTREE_TO_EV
+            lumo_a  = float(mo_ea[mo_oa == 0][0]) if (mo_oa == 0).any() else float("inf")
+            lumo_b  = float(mo_eb[mo_ob == 0][0]) if (mo_ob == 0).any() else float("inf")
+            lumo_ev = min(lumo_a, lumo_b) * HARTREE_TO_EV
+
+        gap_ev = round(lumo_ev - homo_ev, 4)
+        return round(homo_ev, 4), round(lumo_ev, 4), gap_ev
+
+    except Exception as e:
+        print(f"    [PySCF] Error: {e}")
+        return None
+
+
 # ================= RESULT EXTRACTION =================
 
 def extract_result_dict(output_filepath, pdb_name, charge, mult, atom_hash):
@@ -387,10 +443,32 @@ def process_single_pdb(job_args: tuple):
         mult = 1 if (electrons % 2 == 0) else 2
         candidates.append((charge, mult))
 
-    use_quick = specs.get("gpu_available", False) and specs.get("quick_found", False)
+    use_pyscf = specs.get("gpu_available", False) and specs.get("pyscf_found", False)
+    use_quick = (specs.get("gpu_available", False) and specs.get("quick_found", False)
+                 and not use_pyscf)
 
     for c, m in candidates:
-        if use_quick:
+        if use_pyscf:
+            print(f"    [PySCF] Attempting: Charge {c}, Multiplicity {m}")
+            result = run_pyscf_attempt(c, m, atoms, work_dir, gpu_id)
+            if result is not None:
+                homo_ev, lumo_ev, gap_ev = result
+                print(f"    >> PySCF SUCCESS: HOMO={homo_ev:.3f} eV, LUMO={lumo_ev:.3f} eV, Gap={gap_ev:.3f} eV")
+                return {
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Filename":  pdb_path.name,
+                    "Engine":    "PySCF",
+                    "Charge":    c,
+                    "Mult":      m,
+                    "HOMO_eV":   homo_ev,
+                    "LUMO_eV":   lumo_ev,
+                    "Gap_eV":    gap_ev,
+                    "AtomHash":  atom_hash,
+                }
+            print(f"    [Fallback] PySCF failed for charge={c}. Trying ORCA...")
+            success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
+                                       nprocs, max_core, use_mpi, use_gpu, env)
+        elif use_quick:
             quick_exe = specs.get("quick_exe") or "quick"
             success = run_quick_attempt(c, m, atoms, work_dir, quick_exe)
             if not success:
@@ -400,7 +478,8 @@ def process_single_pdb(job_args: tuple):
         else:
             success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
                                        nprocs, max_core, use_mpi, use_gpu, env)
-        if success:
+
+        if not use_pyscf and success:
             return extract_result_dict(work_dir / OUTPUT_NAME,
                                        pdb_path.name, c, m, atom_hash)
 

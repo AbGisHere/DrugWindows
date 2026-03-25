@@ -509,7 +509,9 @@ def process_single_pdb(job_args: tuple):
         candidates.append((charge, mult))
 
     use_xtb   = specs.get("xtb_found", False)
+    # QUICK struggles with large/near-degenerate systems; cap at 200 electrons
     use_quick = (not use_xtb
+                 and total_z <= 200
                  and specs.get("gpu_available", False)
                  and specs.get("quick_found", False))
 

@@ -67,7 +67,8 @@ def get_hardware_specs() -> dict:
     gpus = detect_gpus()
     return {
         "os": platform.system(),
-        "cpu_cores": os.cpu_count() or 1,
+        "cpu_cores": (len(os.sched_getaffinity(0))
+                      if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1),
         "gpus": gpus,
         "gpu_available": len(gpus) > 0,
         "ram_mb": get_available_ram_mb(),
@@ -200,9 +201,9 @@ def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
                      use_mpi, use_gpu):
     with open(filepath, "w") as f:
         if use_gpu:
-            f.write("! r2SCAN-3c RIJCOSX TightSCF\n")
+            f.write("! r2SCAN-3c RIJCOSX TightSCF SOSCF\n")
         else:
-            f.write("! r2SCAN-3c\n")
+            f.write("! r2SCAN-3c SOSCF\n")
         f.write(f"%maxcore {max_core}\n")
         if use_mpi and nprocs > 1:
             f.write(f"%pal nprocs {nprocs} end\n")

@@ -215,7 +215,7 @@ def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
         # Light level shifting for robustness on QM core systems
         # Shift 0.3 au: stabilises near-degenerate orbitals without slowing convergence
         f.write("%scf\n")
-        f.write("  LevelShift Shift 0.3 ErrOff 0.05 end\n")
+        f.write("  Shift Shift 0.3 ErrOff 0.05 end\n")
         f.write("  MaxIter 300\n")
         f.write("end\n")
         f.write(f"\n* xyz {charge} {mult}\n")

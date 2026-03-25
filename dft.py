@@ -201,14 +201,19 @@ def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
                      use_mpi, use_gpu):
     with open(filepath, "w") as f:
         if use_gpu:
-            f.write("! r2SCAN-3c RIJCOSX TightSCF SOSCF\n")
+            f.write("! r2SCAN-3c RIJCOSX TightSCF SOSCF SlowConv\n")
         else:
-            f.write("! r2SCAN-3c SOSCF\n")
+            f.write("! r2SCAN-3c SOSCF SlowConv\n")
         f.write(f"%maxcore {max_core}\n")
         if use_mpi and nprocs > 1:
             f.write(f"%pal nprocs {nprocs} end\n")
         else:
             print("   [Info] Running Serial (1 Core).")
+        # Level shifting stabilises near-zero HOMO-LUMO gap systems
+        f.write("%scf\n")
+        f.write("  Shift Shift 0.5 ErrOff 0.1 end\n")
+        f.write("  MaxIter 500\n")
+        f.write("end\n")
         f.write(f"\n* xyz {charge} {mult}\n")
         for line in atom_lines:
             f.write(line + "\n")

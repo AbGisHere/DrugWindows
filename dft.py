@@ -200,19 +200,23 @@ def get_pocket_atoms(pdb_path, radius):
 def write_orca_input(filepath, atom_lines, charge, mult, nprocs, max_core,
                      use_mpi, use_gpu):
     with open(filepath, "w") as f:
+        # r2SCAN-3c: composite method (built-in basis+dispersion), fast+accurate
+        # RIJCOSX: GPU-accelerated Coulomb/exchange integrals
+        # NormalSCF (default): sufficient for screening, faster than TightSCF
         if use_gpu:
-            f.write("! r2SCAN-3c RIJCOSX TightSCF SOSCF SlowConv\n")
+            f.write("! r2SCAN-3c RIJCOSX\n")
         else:
-            f.write("! r2SCAN-3c SOSCF SlowConv\n")
+            f.write("! r2SCAN-3c\n")
         f.write(f"%maxcore {max_core}\n")
         if use_mpi and nprocs > 1:
             f.write(f"%pal nprocs {nprocs} end\n")
         else:
             print("   [Info] Running Serial (1 Core).")
-        # Level shifting stabilises near-zero HOMO-LUMO gap systems
+        # Light level shifting for robustness on QM core systems
+        # Shift 0.3 au: stabilises near-degenerate orbitals without slowing convergence
         f.write("%scf\n")
-        f.write("  Shift Shift 0.5 ErrOff 0.1 end\n")
-        f.write("  MaxIter 500\n")
+        f.write("  Shift Shift 0.3 ErrOff 0.05 end\n")
+        f.write("  MaxIter 300\n")
         f.write("end\n")
         f.write(f"\n* xyz {charge} {mult}\n")
         for line in atom_lines:

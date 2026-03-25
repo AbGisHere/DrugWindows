@@ -509,10 +509,7 @@ def process_single_pdb(job_args: tuple):
         candidates.append((charge, mult))
 
     use_xtb   = specs.get("xtb_found", False)
-    use_pyscf = (not use_xtb
-                 and specs.get("gpu_available", False)
-                 and specs.get("pyscf_found", False))
-    use_quick = (not use_xtb and not use_pyscf
+    use_quick = (not use_xtb
                  and specs.get("gpu_available", False)
                  and specs.get("quick_found", False))
 
@@ -524,18 +521,6 @@ def process_single_pdb(job_args: tuple):
             result_tuple = run_xtb_attempt(c, m, atoms, work_dir, nprocs)
             if result_tuple is None:
                 print(f"    [Fallback] XTB failed for charge={c}. Trying ORCA...")
-                success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
-                                           nprocs, max_core, use_mpi, use_gpu, env)
-                if success:
-                    return extract_result_dict(work_dir / OUTPUT_NAME,
-                                               pdb_path.name, c, m, atom_hash)
-                continue
-
-        elif use_pyscf:
-            print(f"    [PySCF] Attempting: Charge {c}, Multiplicity {m}")
-            result_tuple = run_pyscf_attempt(c, m, atoms, work_dir, gpu_id)
-            if result_tuple is None:
-                print(f"    [Fallback] PySCF failed for charge={c}. Trying ORCA...")
                 success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
                                            nprocs, max_core, use_mpi, use_gpu, env)
                 if success:

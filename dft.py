@@ -76,6 +76,7 @@ def get_hardware_specs() -> dict:
         "quick_found": (shutil.which("quick.cuda") or shutil.which("quick.cuda.MPI")
                         or shutil.which("quick")) is not None,
         "pyscf_found": importlib.util.find_spec("gpu4pyscf") is not None,
+        "xtb_found": shutil.which("xtb") is not None,
         "mpi_found": (shutil.which("mpiexec") or shutil.which("mpirun")) is not None,
     }
 
@@ -280,6 +281,69 @@ def run_quick_attempt(charge, mult, atoms, work_dir, quick_exe="quick"):
     except Exception:
         return False
 
+# ================= XTB (GFN2-xTB) =================
+
+def run_xtb_attempt(charge, mult, atoms, work_dir, nprocs):
+    """Run GFN2-xTB on CPU. Returns (homo_ev, lumo_ev, gap_ev) or None."""
+    xyz_path = work_dir / "xtb_input.xyz"
+    out_path = work_dir / "xtb.out"
+
+    with open(xyz_path, "w") as f:
+        f.write(f"{len(atoms)}\n")
+        f.write(f"charge={charge} mult={mult}\n")
+        for line in atoms:
+            f.write(line + "\n")
+
+    uhf = mult - 1
+    cmd = ["xtb", str(xyz_path), "--gfn", "2",
+           "--chrg", str(charge), "--uhf", str(uhf),
+           "--parallel", str(nprocs), "--norestart"]
+    try:
+        with open(out_path, "w") as outfile:
+            subprocess.run(cmd, cwd=str(work_dir),
+                           stdout=outfile, stderr=subprocess.STDOUT,
+                           timeout=JOB_TIMEOUT_S)
+
+        content = out_path.read_text(errors="ignore") if out_path.exists() else ""
+        if "normal termination of xtb" not in content:
+            print(f"    [XTB] Did not terminate normally.")
+            return None
+
+        # Parse orbital eigenvalue table for HOMO/LUMO
+        homo_ev = lumo_ev = None
+        last_occ_ev = None
+        in_table = False
+        for line in content.splitlines():
+            if "Occupation" in line and "Energy/eV" in line:
+                in_table = True
+                continue
+            if in_table:
+                m = re.match(r'\s+\d+\s+([\d.]+)\s+[-\d.]+\s+([-\d.]+)', line)
+                if m:
+                    occ = float(m.group(1))
+                    ev  = float(m.group(2))
+                    if occ > 0:
+                        last_occ_ev = ev
+                    elif last_occ_ev is not None:
+                        homo_ev = last_occ_ev
+                        lumo_ev = ev
+                        break
+
+        if homo_ev is None or lumo_ev is None:
+            print(f"    [XTB] Could not parse HOMO/LUMO from output.")
+            return None
+
+        gap_ev = round(lumo_ev - homo_ev, 4)
+        return round(homo_ev, 4), round(lumo_ev, 4), gap_ev
+
+    except subprocess.TimeoutExpired:
+        print(f"    [XTB] Timed out after {JOB_TIMEOUT_S}s.")
+        return None
+    except Exception as e:
+        print(f"    [XTB] Error: {e}")
+        return None
+
+
 # ================= PYSCF (GPU4PySCF) =================
 
 HARTREE_TO_EV = 27.2114
@@ -443,31 +507,41 @@ def process_single_pdb(job_args: tuple):
         mult = 1 if (electrons % 2 == 0) else 2
         candidates.append((charge, mult))
 
-    use_pyscf = specs.get("gpu_available", False) and specs.get("pyscf_found", False)
-    use_quick = (specs.get("gpu_available", False) and specs.get("quick_found", False)
-                 and not use_pyscf)
+    use_xtb   = specs.get("xtb_found", False)
+    use_pyscf = (not use_xtb
+                 and specs.get("gpu_available", False)
+                 and specs.get("pyscf_found", False))
+    use_quick = (not use_xtb and not use_pyscf
+                 and specs.get("gpu_available", False)
+                 and specs.get("quick_found", False))
 
     for c, m in candidates:
-        if use_pyscf:
+        result_tuple = None
+
+        if use_xtb:
+            print(f"    [XTB] Attempting: Charge {c}, Multiplicity {m}")
+            result_tuple = run_xtb_attempt(c, m, atoms, work_dir, nprocs)
+            if result_tuple is None:
+                print(f"    [Fallback] XTB failed for charge={c}. Trying ORCA...")
+                success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
+                                           nprocs, max_core, use_mpi, use_gpu, env)
+                if success:
+                    return extract_result_dict(work_dir / OUTPUT_NAME,
+                                               pdb_path.name, c, m, atom_hash)
+                continue
+
+        elif use_pyscf:
             print(f"    [PySCF] Attempting: Charge {c}, Multiplicity {m}")
-            result = run_pyscf_attempt(c, m, atoms, work_dir, gpu_id)
-            if result is not None:
-                homo_ev, lumo_ev, gap_ev = result
-                print(f"    >> PySCF SUCCESS: HOMO={homo_ev:.3f} eV, LUMO={lumo_ev:.3f} eV, Gap={gap_ev:.3f} eV")
-                return {
-                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Filename":  pdb_path.name,
-                    "Engine":    "PySCF",
-                    "Charge":    c,
-                    "Mult":      m,
-                    "HOMO_eV":   homo_ev,
-                    "LUMO_eV":   lumo_ev,
-                    "Gap_eV":    gap_ev,
-                    "AtomHash":  atom_hash,
-                }
-            print(f"    [Fallback] PySCF failed for charge={c}. Trying ORCA...")
-            success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
-                                       nprocs, max_core, use_mpi, use_gpu, env)
+            result_tuple = run_pyscf_attempt(c, m, atoms, work_dir, gpu_id)
+            if result_tuple is None:
+                print(f"    [Fallback] PySCF failed for charge={c}. Trying ORCA...")
+                success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
+                                           nprocs, max_core, use_mpi, use_gpu, env)
+                if success:
+                    return extract_result_dict(work_dir / OUTPUT_NAME,
+                                               pdb_path.name, c, m, atom_hash)
+                continue
+
         elif use_quick:
             quick_exe = specs.get("quick_exe") or "quick"
             success = run_quick_attempt(c, m, atoms, work_dir, quick_exe)
@@ -475,13 +549,34 @@ def process_single_pdb(job_args: tuple):
                 print(f"    [Fallback] QUICK failed for charge={c}. Trying ORCA...")
                 success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
                                            nprocs, max_core, use_mpi, use_gpu, env)
+            if success:
+                return extract_result_dict(work_dir / OUTPUT_NAME,
+                                           pdb_path.name, c, m, atom_hash)
+            continue
+
         else:
             success = run_orca_attempt(c, m, atoms, orca_exe, work_dir,
                                        nprocs, max_core, use_mpi, use_gpu, env)
+            if success:
+                return extract_result_dict(work_dir / OUTPUT_NAME,
+                                           pdb_path.name, c, m, atom_hash)
+            continue
 
-        if not use_pyscf and success:
-            return extract_result_dict(work_dir / OUTPUT_NAME,
-                                       pdb_path.name, c, m, atom_hash)
+        if result_tuple is not None:
+            homo_ev, lumo_ev, gap_ev = result_tuple
+            engine = "XTB" if use_xtb else "PySCF"
+            print(f"    >> {engine} SUCCESS: HOMO={homo_ev:.3f} eV, LUMO={lumo_ev:.3f} eV, Gap={gap_ev:.3f} eV")
+            return {
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Filename":  pdb_path.name,
+                "Engine":    engine,
+                "Charge":    c,
+                "Mult":      m,
+                "HOMO_eV":   homo_ev,
+                "LUMO_eV":   lumo_ev,
+                "Gap_eV":    gap_ev,
+                "AtomHash":  atom_hash,
+            }
 
     print(f"    All attempts failed for {pdb_path.name}. Check {work_dir / OUTPUT_NAME}")
     return None
